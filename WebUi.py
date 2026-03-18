@@ -1,0 +1,939 @@
+import json
+import os
+import time
+import re
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ================= 配置与常量（唯一权威来源） =================
+UI_PORT = 8888
+BACKEND_API_BASE = "http://127.0.0.1:22333"
+
+KEYS_FILE = "keys.json"
+HISTORY_FILE = "history.json"
+CHAT_FILE = "chat_history.json"
+FILE_LOCK = threading.Lock()
+
+MODEL_COSTS = {
+    "gemini-3.1-flash-image": {"512px": 4, "1k": 6, "2k": 10, "4k": 13},
+    "gemini-3-pro-image": {"1k": 10, "2k": 10, "4k": 18}
+}
+
+MODEL_DISPLAY_NAMES = {
+    "gemini-3.1-flash-image": "🍌Nano Banana 2",
+    "gemini-3-pro-image": "🍌Nano Banana Pro"
+}
+
+SEVEN_DAYS_SEC = 7 * 24 * 3600
+
+# ================= 核心工具 =================
+def load_json(filename, default_val):
+    if not os.path.exists(filename): return default_val
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return default_val
+
+def save_json(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def calculate_cost(model, size, n):
+    cost_map = MODEL_COSTS.get(model, {})
+    return cost_map.get(size, 10) * int(n)
+
+def get_available_key(cost):
+    with FILE_LOCK:
+        keys = load_json(KEYS_FILE, [])
+        if not keys:
+            return None
+        if cost == 0:
+            for k_obj in keys:
+                if k_obj.get("points", 0) > 0:
+                    return k_obj["key"]
+            return keys[0]["key"]
+        for k_obj in keys:
+            if k_obj.get("points", 0) >= cost:
+                k_obj["points"] -= cost
+                save_json(KEYS_FILE, keys)
+                return k_obj["key"]
+        return None
+
+def get_current_key_info():
+    with FILE_LOCK:
+        keys = load_json(KEYS_FILE, [])
+        for k_obj in keys:
+            if k_obj.get("points", 0) > 0:
+                return {"key_prefix": k_obj["key"][:12] + "...", "points": k_obj["points"]}
+        if keys:
+            return {"key_prefix": keys[0]["key"][:12] + "...", "points": keys[0].get("points", 0)}
+        return {"key_prefix": "未配置Key", "points": 0}
+
+def clean_and_load_history():
+    with FILE_LOCK:
+        history = load_json(HISTORY_FILE, [])
+        now = time.time()
+        valid = [h for h in history if now - h.get("created_at", now) <= SEVEN_DAYS_SEC]
+        if len(valid) != len(history):
+            save_json(HISTORY_FILE, valid)
+        return valid
+
+def save_history(records):
+    with FILE_LOCK:
+        now = time.time()
+        for rec in records:
+            rec["created_at"] = now
+            if "id" not in rec:
+                rec["id"] = f"h_{int(now*1000)}_{hash(rec.get('url',''))%100000}"
+        history = load_json(HISTORY_FILE, [])
+        for rec in reversed(records):
+            history.insert(0, rec)
+        save_json(HISTORY_FILE, history)
+
+def delete_history_item(item_id):
+    with FILE_LOCK:
+        history = load_json(HISTORY_FILE, [])
+        history = [h for h in history if h.get("id") != item_id]
+        save_json(HISTORY_FILE, history)
+
+def load_chat_history():
+    with FILE_LOCK:
+        chats = load_json(CHAT_FILE, [])
+        now = time.time()
+        valid = [c for c in chats if now - c.get("created_at", now) <= SEVEN_DAYS_SEC]
+        if len(valid) != len(chats):
+            save_json(CHAT_FILE, valid)
+        return valid
+
+def save_chat_record(record):
+    with FILE_LOCK:
+        chats = load_json(CHAT_FILE, [])
+        chats.append(record)
+        save_json(CHAT_FILE, chats)
+
+def delete_chat_record(chat_id):
+    with FILE_LOCK:
+        chats = load_json(CHAT_FILE, [])
+        chats = [c for c in chats if c.get("id") != chat_id]
+        save_json(CHAT_FILE, chats)
+
+def extract_urls_and_parse(data):
+    urls = []
+    if isinstance(data, dict) and "result" in data:
+        result_str = str(data["result"])
+        json_blocks = re.findall(r'\{[^{}]*"url"\s*:\s*"https?://[^"]+?"[^{}]*\}', result_str)
+        for jb in json_blocks:
+            try:
+                parsed = json.loads(jb)
+                if "url" in parsed and parsed["url"].startswith("http"):
+                    urls.append(parsed["url"])
+            except:
+                pass
+        if not urls:
+            found = re.findall(r'(https?://[^\s"\'\\}<>]+\.(?:jpeg|jpg|png|webp|gif))', result_str)
+            urls.extend(found)
+    if not urls and isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], list):
+            for item in data["data"]:
+                if isinstance(item, dict) and "url" in item:
+                    urls.append(item["url"])
+    if not urls:
+        raw = str(data)
+        found = re.findall(r'(https?://[^\s"\'\\}<>]+)', raw)
+        for u in found:
+            if len(u) > 15:
+                urls.append(u)
+    return list(dict.fromkeys(urls))
+
+def call_backend(endpoint, payload, api_key):
+    url = f"{BACKEND_API_BASE}{endpoint}"
+    payload["api_key"] = api_key
+    body_bytes = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=body_bytes, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as response:
+            body = response.read().decode('utf-8')
+            try:
+                parsed = json.loads(body)
+            except:
+                parsed = {"result": body}
+            print(f"[Backend {response.status}] {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}")
+            return parsed, response.status
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8')
+        try:
+            parsed = json.loads(body)
+        except:
+            parsed = {"error": body}
+        urls = extract_urls_and_parse(parsed)
+        if urls:
+            parsed["extracted_urls"] = urls
+            return parsed, 200
+        return parsed, e.code
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+# ================= HTML =================
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Image Chat Studio</title>
+    <style>
+        :root {
+            --bg: #09090b; --surface: #18181b; --surface-hover: #27272a;
+            --border: #3f3f46; --border-focus: #71717a;
+            --text: #fafafa; --text-muted: #a1a1aa;
+            --accent: #10b981; --accent-hover: #059669;
+            --radius-lg: 16px; --radius-md: 10px; --radius-sm: 6px;
+        }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        body { background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden; }
+
+        .sidebar { width: 300px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1); z-index: 10; }
+        .sidebar.collapsed { margin-left: -300px; border-right: none; }
+        .sidebar-header { padding: 18px 20px; font-size: 16px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .tab-nav { display: flex; border-bottom: 1px solid var(--border); }
+        .tab-btn { flex: 1; padding: 12px; background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 13px; font-weight: 500; transition: 0.2s; }
+        .tab-btn.active { color: var(--text); border-bottom: 2px solid var(--text); }
+        .tab-content { flex: 1; overflow-y: auto; padding: 15px; display: none; }
+        .tab-content.active { display: block; }
+
+        .key-input-group { display: flex; gap: 8px; margin-bottom: 15px; }
+        .key-input-group input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 12px; border-radius: var(--radius-sm); outline: none; }
+        .key-input-group input:focus { border-color: var(--accent); }
+        .key-input-group button { background: var(--text); color: var(--bg); border: none; padding: 0 16px; border-radius: var(--radius-sm); cursor: pointer; font-weight: 600; }
+        .key-item { background: var(--bg); padding: 12px; border-radius: var(--radius-md); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; border: 1px solid var(--border); }
+
+        .history-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .history-item { aspect-ratio: 1; background: var(--bg); border-radius: var(--radius-md); overflow: hidden; position: relative; border: 1px solid transparent; transition: 0.2s; }
+        .history-item:hover { border-color: var(--border-focus); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        .history-item img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
+        .history-item .tag { position: absolute; bottom: 6px; right: 6px; background: rgba(0,0,0,0.8); font-size: 10px; padding: 3px 6px; border-radius: 4px; }
+        .history-item .hist-actions { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; padding: 4px; opacity: 0; transition: 0.2s; }
+        .history-item:hover .hist-actions { opacity: 1; }
+        .hist-act-btn { width: 24px; height: 24px; border-radius: 50%; border: none; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .hist-use-btn { background: rgba(16,185,129,0.85); color: #fff; }
+        .hist-del-btn { background: rgba(239,68,68,0.85); color: #fff; }
+
+        .workspace { flex: 1; display: flex; flex-direction: column; position: relative; background: var(--bg); }
+        .header-bar { padding: 15px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 15px; background: rgba(9,9,11,0.85); backdrop-filter: blur(10px); z-index: 5; position: absolute; width: 100%; }
+        .icon-btn-header { background: transparent; border: none; color: var(--text); cursor: pointer; font-size: 18px; padding: 5px; border-radius: var(--radius-sm); }
+        .icon-btn-header:hover { background: var(--surface); }
+        .key-info-bar { margin-left: auto; font-size: 11px; color: var(--text-muted); display: flex; gap: 6px; align-items: center; opacity: 0.55; }
+        .key-info-bar .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+
+        .feed-container { flex: 1; overflow-y: auto; padding: 75px 20px 280px 20px; display: flex; flex-direction: column; gap: 30px; scroll-behavior: smooth; }
+        .feed-placeholder { margin: auto; color: var(--border); font-size: 20px; font-weight: 600; letter-spacing: 1px; }
+
+        .chat-card { display: flex; flex-direction: column; gap: 12px; max-width: 900px; margin: 10px auto; width: 100%; animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1); position: relative; }
+        .chat-card .card-delete-btn { position: absolute; top: 0; right: 0; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; opacity: 0; transition: 0.2s; padding: 4px 8px; }
+        .chat-card:hover .card-delete-btn { opacity: 0.6; }
+        .chat-card .card-delete-btn:hover { opacity: 1; color: #ef4444; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+
+        .card-header { display: flex; gap: 12px; align-items: flex-start; }
+        .avatar { width: 36px; height: 36px; background: var(--surface); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; border: 1px solid var(--border); flex-shrink: 0; }
+        .prompt-box { background: var(--surface); padding: 14px 18px; border-radius: 0 16px 16px 16px; font-size: 14px; line-height: 1.6; border: 1px solid var(--border); width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .card-attachments { display: flex; gap: 8px; margin-top: 10px; overflow-x: auto; padding-bottom: 5px; }
+        .card-attachments img { height: 48px; width: 48px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: pointer; }
+        .param-tags { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+        .param-tag { background: var(--bg); color: var(--text-muted); font-size: 11px; padding: 4px 10px; border-radius: 20px; border: 1px solid var(--border); }
+        .card-content { margin-left: 48px; }
+
+        .result-grid { display: flex; flex-wrap: wrap; gap: 15px; }
+
+        /* 统一的350px图片/loading容器 */
+        .img-slot {
+            width: 200px; height: 200px; border-radius: var(--radius-lg); overflow: hidden;
+            border: 1px solid var(--border); background: var(--surface); flex-shrink: 0;
+            position: relative; transition: 0.3s;
+        }
+        .img-slot:hover { border-color: var(--accent); box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+        .img-slot img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
+
+        /* loading状态 */
+        .img-slot .lp-inner { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+        .img-slot .lp-particles { position: absolute; inset: 0; }
+        .img-slot .lp-particle { position: absolute; border-radius: 50%; opacity: 0; animation: particleGather 2.5s ease-in-out infinite; }
+        .img-slot .lp-center-glow { width: 60px; height: 60px; border-radius: 50%; background: radial-gradient(circle, rgba(16,185,129,0.3) 0%, transparent 70%); animation: pulseGlow 2s ease-in-out infinite; z-index: 2; }
+        .img-slot .lp-text { position: absolute; bottom: 16px; left: 0; right: 0; text-align: center; font-size: 11px; color: var(--text-muted); z-index: 3; }
+        .img-slot .lp-ring { position: absolute; width: 80px; height: 80px; border: 2px solid transparent; border-top-color: var(--accent); border-radius: 50%; animation: spin 1.2s linear infinite; z-index: 2; opacity: 0.5; }
+
+        /* 图片上悬浮的下载按钮 */
+        .img-slot .slot-dl-btn {
+            position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
+            border-radius: var(--radius-sm); background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.15);
+            color: #fff; font-size: 16px; cursor: pointer; display: flex; align-items: center;
+            justify-content: center; opacity: 0; transition: 0.2s; backdrop-filter: blur(4px); z-index: 5;
+        }
+        .img-slot:hover .slot-dl-btn { opacity: 1; }
+        .img-slot .slot-dl-btn:hover { background: rgba(16,185,129,0.8); border-color: var(--accent); transform: scale(1.1); }
+
+        /* 失败状态 */
+        .img-slot .slot-err { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ef4444; font-size: 12px; text-align: center; padding: 20px; }
+
+        @keyframes particleGather {
+            0%   { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; }
+            40%  { opacity: 0.8; }
+            70%  { transform: translate(0, 0) scale(1); opacity: 0.6; }
+            85%  { transform: translate(0, 0) scale(0.5); opacity: 0.3; }
+            100% { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; }
+        }
+        @keyframes pulseGlow { 0%, 100% { transform: scale(1); opacity: 0.5; } 50% { transform: scale(1.5); opacity: 0.9; } }
+
+        .card-actions { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
+        .card-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer; transition: 0.2s; font-weight: 500; display: flex;align-items: center;justify-content: center;}
+        .card-btn:hover { background: var(--surface-hover); border-color: var(--border-focus); }
+        .err-text { color: #ef4444; font-size: 13px; }
+
+        .bottom-console-wrapper { position: absolute; bottom: 0; left: 0; width: 100%; padding: 25px 20px; background: linear-gradient(transparent, var(--bg) 90%); display: flex; justify-content: center; z-index: 20; pointer-events: none; }
+        .input-console { pointer-events: auto; width: 100%; max-width: 700px; background: rgba(25, 25, 25, 0.75); backdrop-filter: blur(10px);border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,0.8); display: flex; flex-direction: column; padding: 14px 18px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .input-console.drag-active { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(16,185,129,0.15), 0 12px 40px rgba(0,0,0,0.8); background: #1c211f; transform: translateY(-2px); }
+        .input-console:focus-within { border-color: var(--border-focus); box-shadow: 0 8px 30px rgba(0,0,0,0.8); }
+
+        .attachments-queue { display: flex; gap: 10px; overflow-x: auto; margin-bottom: 8px; padding-bottom: 4px; }
+        .attachments-queue:empty { display: none; }
+        .attachment-item { position: relative; width: 64px; height: 64px; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border); flex-shrink: 0; animation: scaleIn 0.2s; }
+        @keyframes scaleIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .attachment-item img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
+        .attachment-item .overlay-delete { position: absolute; inset: 0; background: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.2s; cursor: pointer; color: white; font-size: 16px; }
+        .attachment-item:hover .overlay-delete { opacity: 1; }
+        .attachment-item .upload-spinner { position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; }
+
+        textarea { background: transparent; border: none; color: var(--text); font-size: 15px; resize: none; outline: none; width: 100%; max-height: 250px; min-height: 80px; padding: 10px 0; line-height: 1.6; }
+        textarea::placeholder { color: var(--border-focus); }
+        .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 10px; flex-wrap: wrap; }
+        .tools-left { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+        .custom-select { position: relative; user-select: none; font-size: 13px; }
+        .cs-selected { background: var(--bg); border: 1px solid var(--border); padding: 8px 14px; border-radius: 20px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: 0.2s; color: var(--text-muted); font-weight: 500; white-space: nowrap; }
+        .cs-selected:hover { background: var(--surface-hover); color: var(--text); border-color: var(--border-focus); }
+        .cs-selected::after { content: "▼"; font-size: 10px; color: var(--border-focus); transition: 0.2s; }
+        .custom-select.open .cs-selected { border-color: var(--border-focus); color: var(--text); }
+        .custom-select.open .cs-selected::after { transform: rotate(180deg); }
+        .cs-options { position: absolute; bottom: calc(100% + 8px); left: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 10px 30px rgba(0,0,0,0.9); width: max-content; min-width: 100%; opacity: 0; visibility: hidden; transform: translateY(10px); transition: 0.2s cubic-bezier(0.16, 1, 0.3, 1); z-index: 100; overflow: hidden; padding: 4px; }
+        .custom-select.open .cs-options { opacity: 1; visibility: visible; transform: translateY(0); }
+        .cs-opt { padding: 8px 16px; cursor: pointer; border-radius: var(--radius-sm); transition: 0.1s; color: var(--text); white-space: nowrap; }
+        .cs-opt:hover { background: var(--bg); }
+        .cs-opt.active { background: var(--border); font-weight: bold; }
+
+        .icon-btn { display: flex; align-items: center; justify-content: center; padding: 8px; border-radius: 50%; width: 36px; height: 36px; border: 1px solid transparent; background: transparent; color: var(--text-muted); cursor: pointer; transition: 0.2s; }
+        .icon-btn:hover { background: var(--bg); color: var(--text); border-color: var(--border); }
+        .generate-btn { background: var(--text); color: var(--bg); border: none; padding: 10px 24px; border-radius: 24px; font-weight: 600; font-size: 14px; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 12px rgba(255,255,255,0.1); display: flex; gap: 5px; align-items: center; }
+        .generate-btn:hover { transform: scale(1.03); box-shadow: 0 6px 16px rgba(255,255,255,0.2); }
+        .generate-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .spinner-small { width: 18px; height: 18px; border: 2px solid rgba(16,185,129,0.2); border-top: 2px solid var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+
+        .lightbox-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 9999; display: none; flex-direction: column; align-items: center; justify-content: center; cursor: zoom-out; animation: lbFadeIn 0.2s; }
+        .lightbox-overlay.active { display: flex; }
+        @keyframes lbFadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .lightbox-overlay img { max-width: 92vw; max-height: 85vh; object-fit: contain; border-radius: 8px; box-shadow: 0 0 60px rgba(0,0,0,0.8); cursor: default; }
+        .lightbox-url { margin-top: 12px; font-size: 11px; color: rgba(255,255,255,0.25); max-width: 90vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; cursor: text; }
+        .lightbox-close { position: absolute; top: 20px; right: 28px; background: none; border: none; color: #fff; font-size: 32px; cursor: pointer; opacity: 0.7; transition: 0.2s; }
+        .lightbox-close:hover { opacity: 1; transform: scale(1.1); }
+
+        .scroll-top-btn { position: fixed; bottom: 24px; right: 24px; width: 40px; height: 40px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 18px; cursor: pointer; z-index: 35; display: none; align-items: center; justify-content: center; transition: 0.2s; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        .scroll-top-btn:hover { background: var(--surface-hover); color: var(--text); border-color: var(--border-focus); transform: translateY(-2px); }
+        .scroll-top-btn.visible { display: flex; }
+    </style>
+</head>
+<body>
+
+<div class="lightbox-overlay" id="lightbox" onclick="closeLightbox()">
+    <button class="lightbox-close" onclick="closeLightbox()">✕</button>
+    <img id="lightboxImg" src="" onclick="event.stopPropagation()">
+    <div class="lightbox-url" id="lightboxUrl" onclick="event.stopPropagation()"></div>
+</div>
+
+<button class="scroll-top-btn" id="scrollTopBtn" onclick="scrollToTop()" title="回到顶部"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAyklEQVR4nO3WSwrCMBAG4DmOC13Zpe4t3rH5p92YiaeqotRLKFGUIrVJa2pRMzA0JAMfQx6UKMbfhVKyZpY9s5xDJKB3gEmdsC0MhdaydMIDoNekCH8VDOgKkDmzSez4U/Apy2R2r1dqOwH0YVAY0FWeb6a2zn7rY1fn9Ab86NR2ySzH57m2zqkn3IQ2rr3CqQfchnrj1BW2p9dnH+v7b097iI4XvtfmVmOSojDLQe4xj/WAcIQ5wtIdxli/PoBJA+OlUrJywjF+Li4Ur0SlSNbYGwAAAABJRU5ErkJggg==" alt="up-squared" style="width: 20px;height: 20px;"></button>
+
+<aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+        <span>⚙️ 控制中心</span>
+        <button class="icon-btn" style="width:28px; height:28px; font-size:12px;" onclick="toggleSidebar()">✕</button>
+    </div>
+    <div class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab('history')">图库 (7天)</button>
+        <button class="tab-btn" onclick="switchTab('keys')">Key 轮询池</button>
+    </div>
+    <div class="tab-content active" id="tab-history">
+        <div class="history-grid" id="historyGrid"></div>
+    </div>
+    <div class="tab-content" id="tab-keys">
+        <div class="key-input-group">
+            <input type="text" id="newKey" placeholder="输入新的 Key">
+            <button onclick="addKey()">添加</button>
+        </div>
+        <div id="keyList"></div>
+    </div>
+</aside>
+
+<main class="workspace">
+    <div class="header-bar">
+        <button class="icon-btn-header" onclick="toggleSidebar()">☰</button>
+        <span style="font-weight: 600; font-size:16px;">AI Image Studio</span>
+        <div class="key-info-bar" id="keyInfoBar">
+            <span class="dot"></span>
+            <span id="keyInfoText">加载中...</span>
+        </div>
+    </div>
+
+    <div class="feed-container" id="chatFeed">
+        <div class="feed-placeholder" id="emptyState"></div>
+    </div>
+
+    <div class="bottom-console-wrapper">
+        <div class="input-console" id="dropzone">
+            <div class="attachments-queue" id="attachmentsQueue"></div>
+            <textarea id="prompt" rows="1" placeholder="描述你想生成的画面... (Ctrl+Enter 生成 / 可拖拽或Ctrl+V粘贴图片)"></textarea>
+            <div class="toolbar">
+                <div class="tools-left">
+                    <input type="file" id="fileInput" accept="image/*" multiple onchange="handleFileSelect(event)" style="display:none;">
+                    <button class="icon-btn" onclick="document.getElementById('fileInput').click()" title="上传参考图">📎</button>
+                    <div class="custom-select" id="sel-model" data-value="">
+                        <div class="cs-selected">选择模型</div>
+                        <div class="cs-options" id="opt-model"></div>
+                    </div>
+                    <div class="custom-select" id="sel-size" data-value="">
+                        <div class="cs-selected">尺寸</div>
+                        <div class="cs-options" id="opt-size"></div>
+                    </div>
+                    <div class="custom-select" id="sel-ratio" data-value="">
+                        <div class="cs-selected">比例</div>
+                        <div class="cs-options" id="opt-ratio"></div>
+                    </div>
+                    <div class="custom-select" id="sel-n" data-value="">
+                        <div class="cs-selected">数量</div>
+                        <div class="cs-options" id="opt-n"></div>
+                    </div>
+                </div>
+                <button class="generate-btn" id="generateBtn" onclick="submitTask()">
+                    ✨ 生成 (<span id="costDisplay">0</span>点)
+                </button>
+            </div>
+        </div>
+    </div>
+</main>
+
+<script>
+    let MODEL_COSTS = {};
+    let MODEL_NAMES = {};
+    let attachedUrls = [];
+
+    const RATIO_OPTIONS = [
+        {val:'1:1',label:'1:1'},{val:'3:4',label:'3:4'},{val:'4:3',label:'4:3'},
+        {val:'9:16',label:'9:16'},{val:'16:9',label:'16:9'}
+    ];
+    const N_OPTIONS = [
+        {val:'1',label:'1 张'},{val:'2',label:'2 张'},{val:'3',label:'3 张'},{val:'4',label:'4 张'}
+    ];
+
+    window.onload = async () => {
+        initTextarea();
+        initDropzone();
+        initPasteHandler();
+        await loadConfig();
+        buildAllSelects();
+        bindAllSelectEvents();
+        restoreSidebar();
+        updateCostUI();
+        await loadChatHistory();
+        scrollFeedToBottom();
+        loadGallery();
+        loadKeys();
+        refreshKeyInfo();
+        initScrollTopBtn();
+    };
+
+    async function loadConfig() {
+        try {
+            const res = await fetch('/api/ui_config');
+            const cfg = await res.json();
+            MODEL_COSTS = cfg.model_costs || {};
+            MODEL_NAMES = cfg.model_names || {};
+        } catch(e) { console.error('Config load failed', e); }
+    }
+
+    function getSavedSettings() {
+        try { const r = localStorage.getItem('ai_studio_settings'); return r ? JSON.parse(r) : {}; }
+        catch(e) { return {}; }
+    }
+    function saveSettings() {
+        localStorage.setItem('ai_studio_settings', JSON.stringify({
+            model: document.getElementById('sel-model').dataset.value,
+            size:  document.getElementById('sel-size').dataset.value,
+            ratio: document.getElementById('sel-ratio').dataset.value,
+            n:     document.getElementById('sel-n').dataset.value
+        }));
+    }
+
+    function buildAllSelects() {
+        const saved = getSavedSettings();
+        const models = Object.keys(MODEL_COSTS);
+        if (!models.length) return;
+        const savedModel = (saved.model && MODEL_COSTS[saved.model]) ? saved.model : models[0];
+        fillSelect('sel-model', 'opt-model', models.map(m => ({val:m, label:MODEL_NAMES[m]||m})), savedModel);
+        const sizes = Object.keys(MODEL_COSTS[savedModel] || {});
+        const savedSize = (saved.size && sizes.includes(saved.size)) ? saved.size : (sizes.includes('2k') ? '2k' : sizes[0]);
+        fillSelect('sel-size', 'opt-size', sizes.map(s => ({val:s, label:s})), savedSize);
+        const savedRatio = (saved.ratio && RATIO_OPTIONS.some(r => r.val === saved.ratio)) ? saved.ratio : '16:9';
+        fillSelect('sel-ratio', 'opt-ratio', RATIO_OPTIONS, savedRatio);
+        const savedN = (saved.n && N_OPTIONS.some(o => o.val === saved.n)) ? saved.n : '1';
+        fillSelect('sel-n', 'opt-n', N_OPTIONS, savedN);
+    }
+    function fillSelect(selectId, optContainerId, options, activeVal) {
+        const el = document.getElementById(selectId);
+        const container = document.getElementById(optContainerId);
+        let activeLabel = '';
+        container.innerHTML = options.map(o => {
+            const isActive = o.val === activeVal;
+            if (isActive) activeLabel = o.label;
+            return '<div class="cs-opt' + (isActive ? ' active' : '') + '" data-val="' + o.val + '">' + o.label + '</div>';
+        }).join('');
+        el.dataset.value = activeVal;
+        el.querySelector('.cs-selected').innerText = activeLabel || activeVal;
+    }
+    function rebuildSizeSelect(model, preferredSize) {
+        const costs = MODEL_COSTS[model];
+        if (!costs) return;
+        const sizes = Object.keys(costs);
+        const actual = (preferredSize && sizes.includes(preferredSize)) ? preferredSize : (sizes.includes('2k') ? '2k' : sizes[0]);
+        fillSelect('sel-size', 'opt-size', sizes.map(s => ({val:s, label:s})), actual);
+    }
+    function rebuildAllSelectsWithValues(modelId, size, ratio, n) {
+        const models = Object.keys(MODEL_COSTS);
+        if (!models.length) return;
+        const targetModel = (modelId && MODEL_COSTS[modelId]) ? modelId : models[0];
+        fillSelect('sel-model', 'opt-model', models.map(m => ({val:m, label:MODEL_NAMES[m]||m})), targetModel);
+        rebuildSizeSelect(targetModel, size || '');
+        fillSelect('sel-ratio', 'opt-ratio', RATIO_OPTIONS, RATIO_OPTIONS.some(r => r.val === ratio) ? ratio : '16:9');
+        fillSelect('sel-n', 'opt-n', N_OPTIONS, N_OPTIONS.some(o => o.val === String(n)) ? String(n) : '1');
+    }
+
+    function bindAllSelectEvents() {
+        document.addEventListener('click', () => { document.querySelectorAll('.custom-select').forEach(el => el.classList.remove('open')); });
+        document.querySelectorAll('.custom-select').forEach(el => {
+            el.querySelector('.cs-selected').addEventListener('click', function(e) {
+                e.stopPropagation();
+                const wasOpen = el.classList.contains('open');
+                document.querySelectorAll('.custom-select').forEach(x => x.classList.remove('open'));
+                if (!wasOpen) el.classList.add('open');
+            });
+            el.querySelector('.cs-options').addEventListener('click', function(e) {
+                const opt = e.target.closest('.cs-opt');
+                if (!opt) return;
+                e.stopPropagation();
+                this.querySelectorAll('.cs-opt').forEach(o => o.classList.remove('active'));
+                opt.classList.add('active');
+                el.querySelector('.cs-selected').innerText = opt.innerText;
+                el.dataset.value = opt.dataset.val;
+                el.classList.remove('open');
+                if (el.id === 'sel-model') rebuildSizeSelect(opt.dataset.val, getSavedSettings().size || '');
+                updateCostUI(); saveSettings();
+            });
+        });
+    }
+    function updateCostUI() {
+        const model = document.getElementById('sel-model').dataset.value;
+        const size = document.getElementById('sel-size').dataset.value;
+        const n = document.getElementById('sel-n').dataset.value;
+        const costs = MODEL_COSTS[model];
+        document.getElementById('costDisplay').innerText = costs ? ((costs[size]||0) * parseInt(n||1)) : '?';
+    }
+
+    function toggleSidebar() {
+        const sb = document.getElementById('sidebar');
+        sb.classList.toggle('collapsed');
+        localStorage.setItem('ai_sidebar', sb.classList.contains('collapsed') ? 'collapsed' : 'open');
+    }
+    function restoreSidebar() { if (localStorage.getItem('ai_sidebar') === 'collapsed') document.getElementById('sidebar').classList.add('collapsed'); }
+    function switchTab(tabId) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.querySelector('.tab-btn[onclick="switchTab(\''+tabId+'\')"]').classList.add('active');
+        document.getElementById('tab-'+tabId).classList.add('active');
+    }
+    function initTextarea() {
+        const tx = document.getElementById('prompt');
+        tx.addEventListener('input', function() { this.style.height='auto'; this.style.height=this.scrollHeight+'px'; });
+        tx.addEventListener('keydown', function(e) { if (e.key==='Enter' && e.ctrlKey) { e.preventDefault(); submitTask(); } });
+    }
+    function initPasteHandler() {
+        document.addEventListener('paste', function(e) {
+            const items = e.clipboardData && e.clipboardData.items;
+            if (!items) return;
+            const imgs = [];
+            for (let i=0; i<items.length; i++) { if (items[i].type.startsWith('image/')) { const f=items[i].getAsFile(); if(f) imgs.push(f); } }
+            if (imgs.length) { e.preventDefault(); handleFiles(imgs); }
+        });
+    }
+
+    function openLightbox(src) { document.getElementById('lightboxImg').src=src; document.getElementById('lightboxUrl').innerText=src; document.getElementById('lightbox').classList.add('active'); }
+    function closeLightbox() { document.getElementById('lightbox').classList.remove('active'); }
+    document.addEventListener('keydown', e => { if (e.key==='Escape') closeLightbox(); });
+    function scrollFeedToBottom() { const f=document.getElementById('chatFeed'); f.scrollTop=f.scrollHeight; }
+    function scrollToTop() { document.getElementById('chatFeed').scrollTo({top:0,behavior:'smooth'}); }
+    function initScrollTopBtn() {
+        const feed=document.getElementById('chatFeed'), btn=document.getElementById('scrollTopBtn');
+        feed.addEventListener('scroll', function() { if(feed.scrollTop>400) btn.classList.add('visible'); else btn.classList.remove('visible'); });
+    }
+    async function refreshKeyInfo() {
+        try { const r=await fetch('/api/ui_key_info'); const i=await r.json(); document.querySelector('#keyInfoBar .dot').style.background=i.points>0?'var(--accent)':'#ef4444'; document.getElementById('keyInfoText').innerText=i.key_prefix+'  ·  '+i.points+' 点'; } catch(e) { document.getElementById('keyInfoText').innerText='连接异常'; }
+    }
+
+    function initDropzone() {
+        const dz=document.getElementById('dropzone'); let dc=0;
+        dz.addEventListener('dragenter', e => { e.preventDefault(); dc++; dz.classList.add('drag-active'); });
+        dz.addEventListener('dragover', e => e.preventDefault());
+        dz.addEventListener('dragleave', e => { dc--; if(dc===0) dz.classList.remove('drag-active'); });
+        dz.addEventListener('drop', e => { e.preventDefault(); dc=0; dz.classList.remove('drag-active'); if(e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+    }
+    function handleFileSelect(e) { if(e.target.files.length) handleFiles(e.target.files); e.target.value=''; }
+    async function handleFiles(files) { const v=Array.from(files).filter(f=>f.type.startsWith('image/')); if(!v.length) return; await Promise.all(v.map(f=>uploadSingleFile(f))); loadGallery(); }
+    async function uploadSingleFile(file) {
+        return new Promise(resolve => {
+            const reader=new FileReader(); const id='att_'+Date.now()+Math.floor(Math.random()*9000);
+            document.getElementById('attachmentsQueue').insertAdjacentHTML('beforeend','<div class="attachment-item" id="'+id+'"><div class="upload-spinner"><div class="spinner-small"></div></div></div>');
+            reader.onload = async e => {
+                const b64=e.target.result.split(',')[1];
+                try { const r=await fetch('/api/ui_upload',{method:'POST',body:JSON.stringify({image_base64:b64})}); const d=await r.json(); let url=d.url; if(!url&&d.extracted_urls&&d.extracted_urls.length) url=d.extracted_urls[0]; if(r.status===200&&url&&url.startsWith('http')){attachedUrls.push(url);renderAttachmentItem(id,url);} else document.getElementById(id)?.remove(); } catch(err){document.getElementById(id)?.remove();}
+                resolve();
+            }; reader.readAsDataURL(file);
+        });
+    }
+    function renderAttachmentItem(domId,url) { const el=document.getElementById(domId); if(!el)return; const su=url.replace(/'/g,"\\'"); el.innerHTML='<img src="'+url+'" onclick="event.stopPropagation();openLightbox(\''+su+'\')"><div class="overlay-delete" onclick="removeAttachment(\''+su+"','"+domId+'\')">✕</div>'; }
+    function removeAttachment(url,domId) { attachedUrls=attachedUrls.filter(u=>u!==url); document.getElementById(domId)?.remove(); }
+    function appendToAttachments(url) { if(attachedUrls.includes(url))return; attachedUrls.push(url); const id='att_'+Date.now()+Math.floor(Math.random()*9000); const su=url.replace(/'/g,"\\'"); document.getElementById('attachmentsQueue').insertAdjacentHTML('beforeend','<div class="attachment-item" id="'+id+'"><img src="'+url+'" onclick="event.stopPropagation();openLightbox(\''+su+'\')"><div class="overlay-delete" onclick="removeAttachment(\''+su+"','"+id+'\')">✕</div></div>'); }
+    function clearAllAttachments() { attachedUrls=[]; document.getElementById('attachmentsQueue').innerHTML=''; }
+    function downloadImage(url,filename) { fetch(url).then(r=>r.blob()).then(blob=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename||'image.jpg'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href); }).catch(()=>window.open(url)); }
+    function escHtml(s) { const d=document.createElement('div'); d.innerText=s||''; return d.innerHTML; }
+
+    // ===== 单个slot的loading内容 =====
+    function buildSlotLoading() {
+        const colors=['#10b981','#34d399','#6ee7b7','#a7f3d0','#059669','#047857','#065f46'];
+        let particles='';
+        for(let p=0;p<18;p++){
+            const sx=(Math.random()-0.5)*300,sy=(Math.random()-0.5)*300,sz=4+Math.random()*8;
+            const delay=(Math.random()*2).toFixed(2),dur=(2+Math.random()*1.5).toFixed(2);
+            const c=colors[Math.floor(Math.random()*colors.length)];
+            particles+='<div class="lp-particle" style="left:calc(50% - '+(sz/2)+'px);top:calc(50% - '+(sz/2)+'px);width:'+sz+'px;height:'+sz+'px;background:'+c+';--sx:'+sx+'px;--sy:'+sy+'px;animation-delay:'+delay+'s;animation-duration:'+dur+'s;"></div>';
+        }
+        return '<div class="lp-inner"><div class="lp-particles">'+particles+'</div><div class="lp-ring"></div><div class="lp-center-glow"></div><div class="lp-text">Generating...</div></div>';
+    }
+
+    // ===== 单个slot渲染为图片 =====
+    function renderSlotImage(slotId, url) {
+        const el = document.getElementById(slotId);
+        if (!el) return;
+        const su = url.replace(/'/g, "\\'");
+        const fname = url.split('/').pop() || 'image.jpg';
+        el.innerHTML = '<img src="'+url+'" onclick="openLightbox(\''+su+'\')">' +
+            '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button>';
+    }
+    function renderSlotError(slotId, msg) {
+        const el = document.getElementById(slotId);
+        if (!el) return;
+        el.innerHTML = '<div class="slot-err">'+escHtml(msg)+'</div>';
+    }
+
+    // ===== 历史记录的结果渲染（多图带内嵌下载按钮）=====
+    function buildResultHTML(urls, payload) {
+        const safePayload = encodeURIComponent(JSON.stringify(payload));
+        const imgs = urls.map((u,i) => {
+            const su = u.replace(/'/g, "\\'");
+            const fname = u.split('/').pop() || ('image_'+i+'.jpg');
+            return '<div class="img-slot">' +
+                '<img src="'+u+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
+                '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
+        }).join('');
+        return '<div class="result-grid">'+imgs+'</div>' +
+            '<div class="card-actions"><button class="card-btn" onclick="reuseParams(\''+safePayload+'\')"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAzUlEQVR4nO2VQQrCMBBFs/IGit6lB+wlSmfSVT70CFWwCEq70oUn6DkqkRZtTdqEuMyHgZBM5mUC+REiKlRE6sKM3iE6ZqQANsZCUpY7ZrQ69PgDQO0IGCM1FifCY0zS42+Ii5iRjJ1MFrIMW2bcf0+inkVRHjwh773zyZutXSLVBAOIUC3c5zEY4JWwoghYVQQYxaxO9neE6g8AtAsP9RoMyBasJs+xnwO6ISHxgUhXs9RW62PNRKinENXosDqx/iwGSOcGUGefTqOESS8wqcNLOlNStwAAAABJRU5ErkJggg==" alt="refresh" style="width: 15px;height: 15px;"></button></div>';
+    }
+
+    function buildCardHTML(chatObj, contentInner) {
+        const p=chatObj.payload||{}; const modelLabel=MODEL_NAMES[p.model_id]||p.model_id||'?';
+        let attHtml='';
+        if(p.input_images&&p.input_images.length){ attHtml='<div class="card-attachments">'+p.input_images.map(u=>{const su=u.replace(/'/g,"\\'");return '<img src="'+u+'" onclick="openLightbox(\''+su+'\')">';}).join('')+'</div>'; }
+        const cid=chatObj.id||('tmp_'+Date.now());
+        return '<div class="chat-card" id="'+cid+'">'+
+            '<button class="card-delete-btn" onclick="deleteChatCard(\''+cid+'\')" title="删除此记录">✕</button>'+
+            '<div class="card-header"><div class="avatar">✨</div><div class="prompt-box">'+
+            '<div style="font-size:15px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
+            '<div class="param-tags"><span class="param-tag">'+escHtml(modelLabel)+'</span><span class="param-tag">'+escHtml(p.size||'')+'</span><span class="param-tag">'+escHtml(p.aspect_ratio||'')+'</span><span class="param-tag">'+(p.n||1)+'张</span></div></div></div>'+
+            '<div class="card-content" id="content_'+cid+'">'+contentInner+'</div></div>';
+    }
+
+    async function loadChatHistory() {
+        try {
+            const res=await fetch('/api/ui_chats'); const chats=await res.json();
+            if(!chats.length)return;
+            const feed=document.getElementById('chatFeed'); const empty=document.getElementById('emptyState');
+            if(empty) empty.style.display='none';
+            chats.forEach(chat => {
+                let ci='';
+                if(chat.status==='success'&&chat.urls&&chat.urls.length) ci=buildResultHTML(chat.urls,chat.payload);
+                else if(chat.status==='error') ci='<span class="err-text">'+escHtml(chat.error||'生成失败')+'</span>';
+                feed.insertAdjacentHTML('beforeend', buildCardHTML(chat,ci));
+            });
+        } catch(e) { console.error('Load chat failed',e); }
+    }
+
+    async function deleteChatCard(chatId) {
+        document.getElementById(chatId)?.remove();
+        await fetch('/api/ui_chats',{method:'DELETE',body:JSON.stringify({id:chatId})});
+        const feed=document.getElementById('chatFeed');
+        if(!feed.querySelector('.chat-card')){ let e=document.getElementById('emptyState'); if(!e) feed.insertAdjacentHTML('afterbegin','<div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>'); else e.style.display=''; }
+    }
+
+    // ===== 核心：前端并发生成，逐个返回逐个渲染 =====
+    function submitTask() {
+        const prompt=document.getElementById('prompt').value.trim();
+        const model=document.getElementById('sel-model').dataset.value;
+        const size=document.getElementById('sel-size').dataset.value;
+        const ratio=document.getElementById('sel-ratio').dataset.value;
+        const n=parseInt(document.getElementById('sel-n').dataset.value);
+        if(!model||!MODEL_COSTS[model]) return alert("请先选择模型");
+        if(!prompt&&!attachedUrls.length) return alert("请输入创意或上传图片");
+        const empty=document.getElementById('emptyState'); if(empty) empty.style.display='none';
+
+        const taskType=attachedUrls.length>0?'image_to_image':'text_to_image';
+        const payload={type:taskType,prompt,model_id:model,size,aspect_ratio:ratio,n};
+        if(taskType==='image_to_image') payload.input_images=[...attachedUrls];
+
+        const chatId='chat_'+Date.now();
+        const chatObj={id:chatId,payload:{...payload}};
+
+        // 构建n个独立的slot
+        const slotIds=[];
+        let slotsHtml='<div class="result-grid" id="grid_'+chatId+'">';
+        for(let i=0;i<n;i++){
+            const sid=chatId+'_s'+i;
+            slotIds.push(sid);
+            slotsHtml+='<div class="img-slot" id="'+sid+'">'+buildSlotLoading()+'</div>';
+        }
+        slotsHtml+='</div><div class="card-actions" id="actions_'+chatId+'"></div>';
+
+        const feed=document.getElementById('chatFeed');
+        feed.insertAdjacentHTML('beforeend', buildCardHTML(chatObj, slotsHtml));
+        scrollFeedToBottom();
+
+        document.getElementById('prompt').value='';
+        document.getElementById('prompt').style.height='auto';
+        clearAllAttachments();
+        saveSettings();
+
+        // 并发发送n个独立请求
+        executeParallelGeneration(chatId, payload, slotIds);
+    }
+
+    async function executeParallelGeneration(chatId, payload, slotIds) {
+        const n = slotIds.length;
+        const results = new Array(n).fill(null); // {url:..} or {error:..}
+        let doneCount = 0;
+
+        const singlePayload = {...payload, n: 1};
+
+        const promises = slotIds.map((sid, index) => {
+            return fetch('/api/ui_generate', {method:'POST', body:JSON.stringify(singlePayload)})
+                .then(r => r.json().then(data => ({status: r.status, data})))
+                .then(({status, data}) => {
+                    if (status === 200 && data.extracted_urls && data.extracted_urls.length) {
+                        const url = data.extracted_urls[0];
+                        results[index] = {url};
+                        renderSlotImage(sid, url);
+                    } else {
+                        const err = data.error || '未获取到图片';
+                        results[index] = {error: err};
+                        renderSlotError(sid, err);
+                    }
+                })
+                .catch(e => {
+                    results[index] = {error: '网络错误: '+e.message};
+                    renderSlotError(sid, '网络错误');
+                })
+                .finally(() => {
+                    doneCount++;
+                    scrollFeedToBottom();
+                    if (doneCount === n) onAllDone();
+                });
+        });
+
+        async function onAllDone() {
+            const urls = results.filter(r => r && r.url).map(r => r.url);
+            const errors = results.filter(r => r && r.error).map(r => r.error);
+
+            // 添加复用按钮
+            const actionsDiv = document.getElementById('actions_'+chatId);
+            if (actionsDiv) {
+                const safePayload = encodeURIComponent(JSON.stringify(payload));
+                actionsDiv.innerHTML = '<button class="card-btn" onclick="reuseParams(\''+safePayload+'\')"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAzUlEQVR4nO2VQQrCMBBFs/IGit6lB+wlSmfSVT70CFWwCEq70oUn6DkqkRZtTdqEuMyHgZBM5mUC+REiKlRE6sKM3iE6ZqQANsZCUpY7ZrQ69PgDQO0IGCM1FifCY0zS42+Ii5iRjJ1MFrIMW2bcf0+inkVRHjwh773zyZutXSLVBAOIUC3c5zEY4JWwoghYVQQYxaxO9neE6g8AtAsP9RoMyBasJs+xnwO6ISHxgUhXs9RW62PNRKinENXosDqx/iwGSOcGUGefTqOESS8wqcNLOlNStwAAAABJRU5ErkJggg==" alt="refresh" style="width: 15px;height: 15px;"></button>';
+            }
+
+            // 保存聊天记录
+            const chatData = {
+                id: chatId, payload, urls,
+                status: urls.length > 0 ? 'success' : 'error',
+                error: urls.length === 0 ? errors.join('; ') : undefined,
+                created_at: Date.now()/1000
+            };
+            await fetch('/api/ui_chats', {method:'POST', body:JSON.stringify(chatData)});
+            loadGallery(); refreshKeyInfo(); loadKeys();
+        }
+    }
+
+    function reuseParams(encoded) {
+        try {
+            const p=JSON.parse(decodeURIComponent(encoded));
+            document.getElementById('prompt').value=p.prompt||'';
+            rebuildAllSelectsWithValues(p.model_id,p.size,p.aspect_ratio,p.n);
+            clearAllAttachments();
+            if(p.input_images&&p.input_images.length) p.input_images.forEach(u=>appendToAttachments(u));
+            updateCostUI(); document.getElementById('prompt').focus();
+        } catch(e) { console.error('Reuse failed',e); }
+    }
+
+    async function loadGallery() {
+        try {
+            const res=await fetch('/api/ui_history'); const data=await res.json();
+            document.getElementById('historyGrid').innerHTML=data.map(item=>{
+                const tag=item.type==='upload'?'📤':'🎨'; const su=(item.url||'').replace(/'/g,"\\'"); const si=(item.id||'').replace(/'/g,"\\'");
+                return '<div class="history-item"><img src="'+item.url+'" loading="lazy" onclick="openLightbox(\''+su+'\')"/><span class="tag">'+tag+'</span><div class="hist-actions"><button class="hist-act-btn hist-use-btn" onclick="event.stopPropagation();appendToAttachments(\''+su+'\')" title="添加到输入框">＋</button><button class="hist-act-btn hist-del-btn" onclick="event.stopPropagation();deleteGalleryItem(\''+si+'\')" title="删除">✕</button></div></div>';
+            }).join('');
+        } catch(e) {}
+    }
+    async function deleteGalleryItem(id) { if(!id)return; await fetch('/api/ui_history',{method:'DELETE',body:JSON.stringify({id})}); loadGallery(); }
+    async function loadKeys() {
+        try { const r=await fetch('/api/ui_keys'); const keys=await r.json(); document.getElementById('keyList').innerHTML=keys.map(k=>'<div class="key-item"><span style="color:var(--text-muted);">'+k.key.substring(0,12)+'...</span><div><strong style="color:var(--accent);">'+k.points+' 点</strong><button style="background:none;border:none;color:#ef4444;cursor:pointer;margin-left:12px;" onclick="deleteKey(\''+k.key+'\')">✕</button></div></div>').join(''); } catch(e) {}
+    }
+    async function addKey() { const k=document.getElementById('newKey').value.trim(); if(!k)return; await fetch('/api/ui_keys',{method:'POST',body:JSON.stringify({key:k})}); document.getElementById('newKey').value=''; loadKeys(); refreshKeyInfo(); }
+    async function deleteKey(k) { await fetch('/api/ui_keys',{method:'DELETE',body:JSON.stringify({key:k})}); loadKeys(); refreshKeyInfo(); }
+</script>
+</body>
+</html>"""
+
+# ================= HTTP 服务 =================
+class UIProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+
+    def _send(self, status, payload=None, ctype='application/json'):
+        self.send_response(status)
+        self.send_header('Content-type', ctype)
+        self.end_headers()
+        if payload is not None:
+            if 'json' in ctype:
+                self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+            else:
+                self.wfile.write(payload.encode('utf-8'))
+
+    def _body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        if length == 0: return {}
+        try: return json.loads(self.rfile.read(length).decode('utf-8'))
+        except: return None
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/": self._send(200, HTML_PAGE, 'text/html; charset=utf-8')
+        elif path == "/api/ui_keys": self._send(200, load_json(KEYS_FILE, []))
+        elif path == "/api/ui_history": self._send(200, clean_and_load_history())
+        elif path == "/api/ui_chats": self._send(200, load_chat_history())
+        elif path == "/api/ui_config": self._send(200, {"model_costs": MODEL_COSTS, "model_names": MODEL_DISPLAY_NAMES})
+        elif path == "/api/ui_key_info": self._send(200, get_current_key_info())
+        else: self._send(404, {"error": "Not found"})
+
+    def do_DELETE(self):
+        path = urllib.parse.urlparse(self.path).path
+        data = self._body()
+        if path == "/api/ui_keys":
+            if data:
+                with FILE_LOCK:
+                    keys = load_json(KEYS_FILE, [])
+                    keys = [k for k in keys if k.get("key") != data.get("key")]
+                    save_json(KEYS_FILE, keys)
+            self._send(200, {"status": "ok"})
+        elif path == "/api/ui_history":
+            if data and data.get("id"): delete_history_item(data["id"])
+            self._send(200, {"status": "ok"})
+        elif path == "/api/ui_chats":
+            if data and data.get("id"): delete_chat_record(data["id"])
+            self._send(200, {"status": "ok"})
+        else: self._send(404, {"error": "Not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        data = self._body()
+        if data is None: return self._send(400, {"error": "Invalid JSON"})
+
+        if path == "/api/ui_keys":
+            new_key = data.get("key")
+            if new_key:
+                with FILE_LOCK:
+                    keys = load_json(KEYS_FILE, [])
+                    if not any(k.get("key") == new_key for k in keys):
+                        keys.append({"key": new_key, "points": 50})
+                        save_json(KEYS_FILE, keys)
+            return self._send(200, {"status": "ok"})
+
+        elif path == "/api/ui_chats":
+            if data and data.get("id"): save_chat_record(data)
+            return self._send(200, {"status": "ok"})
+
+        elif path == "/api/ui_generate":
+            task_type = data.pop("type", "text_to_image")
+            model = data.get("model_id")
+            size = data.get("size")
+            n = int(data.get("n", 1))
+
+            # 每次请求扣单张费用（前端并发n次，每次n=1）
+            single_cost = calculate_cost(model, size, 1)
+            api_key = get_available_key(single_cost)
+            if not api_key:
+                return self._send(400, {"error": f"点数不足！需要 {single_cost} 点，无可用Key。"})
+
+            endpoint = "/v1/images/generations" if task_type == "text_to_image" else "/v1/images/edits"
+            data["n"] = 1  # 强制单张
+            res_data, status = call_backend(endpoint, data, api_key)
+
+            if "extracted_urls" not in res_data:
+                urls = extract_urls_and_parse(res_data)
+                res_data["extracted_urls"] = urls
+            else:
+                urls = res_data["extracted_urls"]
+
+            if urls:
+                save_history([{"type": task_type, "url": u} for u in urls])
+                status = 200
+
+            return self._send(status, res_data)
+
+        elif path == "/api/ui_upload":
+            api_key = get_available_key(0)
+            if not api_key: return self._send(400, {"error": "缺少 API Key 配置"})
+            res_data, status = call_backend("/v1/images/upload", data, api_key)
+            urls = extract_urls_and_parse(res_data)
+            res_data["extracted_urls"] = urls
+            res_data["url"] = urls[0] if urls else None
+            if urls: save_history([{"type": "upload", "url": urls[0]}])
+            return self._send(status, res_data)
+
+        else: self._send(404, {"error": "Not found"})
+
+if __name__ == '__main__':
+    server = ThreadingHTTPServer(('0.0.0.0', UI_PORT), UIProxyHandler)
+    print(f"🚀 [AI Image Studio] 代理服务已启动！")
+    print(f"👉 访问地址: http://127.0.0.1:{UI_PORT}")
+    print(f"📦 模型配置: {list(MODEL_COSTS.keys())}")
+    try: server.serve_forever()
+    except KeyboardInterrupt: print("\n服务关闭。"); server.server_close()
