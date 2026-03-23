@@ -6,6 +6,7 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
+import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ================= 配置与常量（唯一权威来源） =================
@@ -14,8 +15,10 @@ BACKEND_API_BASE = "http://127.0.0.1:22333"
 
 KEYS_FILE = "keys.json"
 HISTORY_FILE = "history.json"
-CHAT_FILE = "chat_history.json"
-FILE_LOCK = threading.Lock()
+SESSIONS_FILE = "sessions.json"
+
+# 使用可重入锁 RLock，彻底解决多层函数调用导致的死锁问题
+FILE_LOCK = threading.RLock()
 
 MODEL_COSTS = {
     "gemini-3.1-flash-image": {"512px": 4, "1k": 6, "2k": 10, "4k": 13},
@@ -28,50 +31,62 @@ MODEL_DISPLAY_NAMES = {
 }
 
 SEVEN_DAYS_SEC = 7 * 24 * 3600
+# 需要拦截的伪装成成功的无效链接
+TARGET_ERROR_URL = "https://api.imastudio.com/open/v1/tasks/create"
 
 # ================= 核心工具 =================
 def load_json(filename, default_val):
     if not os.path.exists(filename): return default_val
     try:
         with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
+            content = f.read().strip()
+            if not content: return default_val
+            return json.loads(content)
+    except Exception as e:
+        print(f"[Warn] 无法加载文件 {filename}, 将使用默认值。错误: {e}")
         return default_val
 
 def save_json(filename, data):
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # 原子化安全写入，先转文本再写入，防止异常打断导致文件被清空变成0字节
+    try:
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+    except Exception as e:
+        print(f"[Error] 保存文件 {filename} 失败: {e}")
 
 def calculate_cost(model, size, n):
     cost_map = MODEL_COSTS.get(model, {})
     return cost_map.get(size, 10) * int(n)
 
 def get_available_key(cost):
+    """获取可用Key并在内存中预扣费"""
     with FILE_LOCK:
         keys = load_json(KEYS_FILE, [])
         if not keys:
-            return None
+            return None, 0
         if cost == 0:
             for k_obj in keys:
                 if k_obj.get("points", 0) > 0:
-                    return k_obj["key"]
-            return keys[0]["key"]
+                    return k_obj["key"], k_obj["points"]
+            return keys[0]["key"], keys[0].get("points", 0)
         for k_obj in keys:
             if k_obj.get("points", 0) >= cost:
                 k_obj["points"] -= cost
                 save_json(KEYS_FILE, keys)
-                return k_obj["key"]
-        return None
+                return k_obj["key"], k_obj["points"]
+        return None, 0
 
-def get_current_key_info():
+def refund_key(api_key, cost):
+    """如果生成失败，将预扣的点数退还"""
+    if cost <= 0 or not api_key: return
     with FILE_LOCK:
         keys = load_json(KEYS_FILE, [])
         for k_obj in keys:
-            if k_obj.get("points", 0) > 0:
-                return {"key_prefix": k_obj["key"][:12] + "...", "points": k_obj["points"]}
-        if keys:
-            return {"key_prefix": keys[0]["key"][:12] + "...", "points": keys[0].get("points", 0)}
-        return {"key_prefix": "未配置Key", "points": 0}
+            if k_obj.get("key") == api_key:
+                k_obj["points"] += cost
+                save_json(KEYS_FILE, keys)
+                break
 
 def clean_and_load_history():
     with FILE_LOCK:
@@ -100,26 +115,52 @@ def delete_history_item(item_id):
         history = [h for h in history if h.get("id") != item_id]
         save_json(HISTORY_FILE, history)
 
-def load_chat_history():
+def migrate_old_chats():
     with FILE_LOCK:
-        chats = load_json(CHAT_FILE, [])
-        now = time.time()
-        valid = [c for c in chats if now - c.get("created_at", now) <= SEVEN_DAYS_SEC]
-        if len(valid) != len(chats):
-            save_json(CHAT_FILE, valid)
-        return valid
+        if os.path.exists("chat_history.json") and not os.path.exists(SESSIONS_FILE):
+            old_chats = load_json("chat_history.json", [])
+            if old_chats:
+                now = time.time()
+                title = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+                new_sess = {"id": f"sess_migrated_{int(now*1000)}", "title": f"旧数据迁移 {title}", "created_at": now, "messages": old_chats}
+                save_json(SESSIONS_FILE, [new_sess])
 
-def save_chat_record(record):
+def load_sessions():
     with FILE_LOCK:
-        chats = load_json(CHAT_FILE, [])
-        chats.append(record)
-        save_json(CHAT_FILE, chats)
+        return load_json(SESSIONS_FILE, [])
 
-def delete_chat_record(chat_id):
+def save_sessions(sessions):
     with FILE_LOCK:
-        chats = load_json(CHAT_FILE, [])
-        chats = [c for c in chats if c.get("id") != chat_id]
-        save_json(CHAT_FILE, chats)
+        save_json(SESSIONS_FILE, sessions)
+
+def create_session():
+    sessions = load_sessions()
+    now = time.time()
+    title = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+    new_sess = {"id": f"sess_{int(now*1000)}", "title": title, "created_at": now, "messages": []}
+    sessions.insert(0, new_sess)
+    save_sessions(sessions)
+    return new_sess
+
+def cleanup_ghost_tasks():
+    """每次启动时清理因为 CLI 服务强行中断而遗留的 'generating' 幽灵卡片"""
+    with FILE_LOCK:
+        sessions = load_sessions()
+        ghost_count = 0
+        for s in sessions:
+            for msg in s.get("messages", []):
+                if msg.get("status") == "generating":
+                    msg["status"] = "error"
+                    msg["error"] = "CLI 服务中断"
+                    
+                    n = msg.get("payload", {}).get("n", 1)
+                    msg["errors"] = ["CLI 服务中断"] * n
+                    
+                    ghost_count += 1
+        
+        if ghost_count > 0:
+            save_sessions(sessions)
+            print(f"🔧 [System] 发现并清理了 {ghost_count} 个由于服务异常中断遗留的幽灵任务。")
 
 def extract_urls_and_parse(data):
     urls = []
@@ -177,6 +218,89 @@ def call_backend(endpoint, payload, api_key):
     except Exception as e:
         return {"error": str(e)}, 500
 
+# ================= 后台并发增量生成任务 =================
+def single_generation(payload, cost_per_image, index):
+    start_t = time.time()
+    # 预扣费
+    api_key, remaining = get_available_key(cost_per_image)
+    if not api_key:
+        return {"error": "点数不足，无可用Key", "time": 0, "cost": 0, "key": "", "remain": 0, "index": index}
+        
+    payload_single = dict(payload)
+    payload_single["n"] = 1
+    endpoint = "/v1/images/generations" if payload_single.get("type", "text_to_image") == "text_to_image" else "/v1/images/edits"
+    
+    res_data, status = call_backend(endpoint, payload_single, api_key)
+    time_taken = round(time.time() - start_t, 1)
+    
+    if "extracted_urls" not in res_data:
+        urls = extract_urls_and_parse(res_data)
+    else:
+        urls = res_data["extracted_urls"]
+        
+    # --- 新增：精准拦截点数耗尽的假链接 ---
+    if urls and TARGET_ERROR_URL in urls:
+        refund_key(api_key, cost_per_image) # 退还预扣的点数
+        return {"error": "云端API KEY过期或点数不足", "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
+
+    if urls:
+        return {"url": urls[0], "time": time_taken, "cost": cost_per_image, "key": api_key, "remain": remaining, "index": index}
+    else:
+        err_msg = res_data.get("error", "获取图片失败")
+        if isinstance(err_msg, dict):
+            err_msg = json.dumps(err_msg, ensure_ascii=False)
+        refund_key(api_key, cost_per_image) # 发生其他错误也退还点数
+        return {"error": str(err_msg), "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
+
+def background_generation(session_id, chat_id, payload, n):
+    cost_per_image = calculate_cost(payload.get("model_id"), payload.get("size"), 1)
+    total_cost = 0
+    last_key = ""
+    last_remain = 0
+    completed_count = 0
+    
+    # 多线程并发，独立插槽更新
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(single_generation, payload, cost_per_image, i) for i in range(n)]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            idx = res["index"]
+            
+            with FILE_LOCK:
+                sessions = load_sessions()
+                for s in sessions:
+                    if s["id"] == session_id:
+                        for msg in s["messages"]:
+                            if msg["id"] == chat_id:
+                                # 确保各个数组已就绪
+                                if not msg.get("urls"): msg["urls"] = [None] * n
+                                if not msg.get("times"): msg["times"] = [None] * n
+                                if not msg.get("errors"): msg["errors"] = [None] * n
+                                
+                                msg["times"][idx] = res["time"]
+                                if "url" in res:
+                                    msg["urls"][idx] = res["url"]
+                                    total_cost += res["cost"]
+                                    last_key = res["key"]
+                                    last_remain = res["remain"]
+                                else:
+                                    msg["errors"][idx] = res["error"]
+                                    
+                                completed_count += 1
+                                if completed_count == n:
+                                    # 全局完成，检查是否有任何成功的
+                                    has_success = any(u for u in msg["urls"] if u is not None)
+                                    msg["status"] = "success" if has_success else "error"
+                                    if total_cost > 0:
+                                        msg["key_info"] = {"key": last_key, "cost": total_cost, "remaining": last_remain}
+                                break
+                        break
+                save_sessions(sessions)
+                
+            if "url" in res:
+                save_history([{"type": payload.get("type", "text_to_image"), "url": res["url"]}])
+
+
 # ================= HTML =================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -203,16 +327,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .sidebar.collapsed { margin-left: -300px; border-right: none; }
         .sidebar-header { padding: 18px 20px; font-size: 16px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
         .tab-nav { display: flex; border-bottom: 1px solid var(--border); }
-        .tab-btn { flex: 1; padding: 12px; background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 13px; font-weight: 500; transition: 0.2s; }
+        .tab-btn { flex: 1; padding: 12px 6px; background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 13px; font-weight: 500; transition: 0.2s; }
         .tab-btn.active { color: var(--text); border-bottom: 2px solid var(--text); }
         .tab-content { flex: 1; overflow-y: auto; padding: 15px; display: none; }
         .tab-content.active { display: block; }
+
+        .session-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .session-item { padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: 0.2s; display: flex; justify-content: space-between; align-items: center; }
+        .session-item.active { border-color: var(--accent); background: #1c211f; }
+        .session-item:hover { border-color: var(--border-focus); }
+        .session-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .session-actions { display: flex; gap: 4px; opacity: 0; transition: 0.2s; }
+        .session-item:hover .session-actions { opacity: 1; }
+        .sess-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 12px; padding: 2px; }
+        .sess-btn:hover { color: var(--text); }
+        .new-sess-btn { width: 100%; padding: 10px; background: var(--surface-hover); border: 1px dashed var(--border-focus); color: var(--text); border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; transition: 0.2s; }
+        .new-sess-btn:hover { background: var(--border); border-style: solid; }
+
+        .filter-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+        .filter-btn { flex: 1; padding: 6px; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; transition: 0.2s; }
+        .filter-btn.active { background: var(--surface-hover); color: var(--text); border-color: var(--accent); }
+        .filter-btn:hover { border-color: var(--border-focus); }
 
         .key-input-group { display: flex; gap: 8px; margin-bottom: 15px; }
         .key-input-group input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 12px; border-radius: var(--radius-sm); outline: none; }
         .key-input-group input:focus { border-color: var(--accent); }
         .key-input-group button { background: var(--text); color: var(--bg); border: none; padding: 0 16px; border-radius: var(--radius-sm); cursor: pointer; font-weight: 600; }
-        .key-item { background: var(--bg); padding: 12px; border-radius: var(--radius-md); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; border: 1px solid var(--border); }
+        .key-item { background: var(--bg); padding: 12px; border-radius: var(--radius-md); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; border: 1px solid var(--border); gap: 10px;}
+        .key-item-str { color: var(--text-muted); font-family: monospace; word-break: break-all; flex: 1; font-size: 12px; }
 
         .history-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
         .history-item { aspect-ratio: 1; background: var(--bg); border-radius: var(--radius-md); overflow: hidden; position: relative; border: 1px solid transparent; transition: 0.2s; }
@@ -229,72 +371,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .header-bar { padding: 15px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 15px; background: rgba(9,9,11,0.85); backdrop-filter: blur(10px); z-index: 5; position: absolute; width: 100%; }
         .icon-btn-header { background: transparent; border: none; color: var(--text); cursor: pointer; font-size: 18px; padding: 5px; border-radius: var(--radius-sm); }
         .icon-btn-header:hover { background: var(--surface); }
-        .key-info-bar { margin-left: auto; font-size: 11px; color: var(--text-muted); display: flex; gap: 6px; align-items: center; opacity: 0.55; }
-        .key-info-bar .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
 
         .feed-container { flex: 1; overflow-y: auto; padding: 75px 20px 280px 20px; display: flex; flex-direction: column; gap: 30px; scroll-behavior: smooth; }
         .feed-placeholder { margin: auto; color: var(--border); font-size: 20px; font-weight: 600; letter-spacing: 1px; }
 
         .chat-card { display: flex; flex-direction: column; gap: 12px; max-width: 900px; margin: 10px auto; width: 100%; animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1); position: relative; }
-        .chat-card .card-delete-btn { position: absolute; top: 0; right: 0; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; opacity: 0; transition: 0.2s; padding: 4px 8px; }
-        .chat-card:hover .card-delete-btn { opacity: 0.6; }
-        .chat-card .card-delete-btn:hover { opacity: 1; color: #ef4444; }
+        
+        .card-top-actions { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; opacity: 0; transition: 0.2s; z-index: 10; }
+        .chat-card:hover .card-top-actions { opacity: 1; }
+        .card-icon-btn { width: 32px; height: 32px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: rgba(24,24,27,0.75); color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(6px); transition: 0.2s; }
+        .card-icon-btn:hover { background: var(--surface-hover); color: var(--text); border-color: var(--border-focus); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .card-icon-btn.del-btn:hover { color: #ef4444; border-color: rgba(239,68,68,0.5); background: rgba(239,68,68,0.15); }
+        
         @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 
         .card-header { display: flex; gap: 12px; align-items: flex-start; }
         .avatar { width: 36px; height: 36px; background: var(--surface); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; border: 1px solid var(--border); flex-shrink: 0; }
-        .prompt-box { background: var(--surface); padding: 14px 18px; border-radius: 0 16px 16px 16px; font-size: 14px; line-height: 1.6; border: 1px solid var(--border); width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .prompt-box { background: var(--surface); padding: 14px 18px; border-radius: 0 16px 16px 16px; font-size: 14px; line-height: 1.6; border: 1px solid var(--border); width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column;}
         .card-attachments { display: flex; gap: 8px; margin-top: 10px; overflow-x: auto; padding-bottom: 5px; }
         .card-attachments img { height: 48px; width: 48px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: pointer; }
-        .param-tags { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+        
+        .param-tags { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; width: 100%; align-items: center; }
         .param-tag { background: var(--bg); color: var(--text-muted); font-size: 11px; padding: 4px 10px; border-radius: 20px; border: 1px solid var(--border); }
+        
+        .key-inline-info { margin-left: auto; display: flex; gap: 14px; font-size: 12px; color: var(--text-muted); align-items: center; padding: 2px 4px; font-family: monospace; }
+        .key-inline-info span { display: flex; align-items: center; gap: 5px; }
+
         .card-content { margin-left: 48px; }
 
         .result-grid { display: flex; flex-wrap: wrap; gap: 15px; }
-
-        /* 统一的350px图片/loading容器 */
-        .img-slot {
-            width: 200px; height: 200px; border-radius: var(--radius-lg); overflow: hidden;
-            border: 1px solid var(--border); background: var(--surface); flex-shrink: 0;
-            position: relative; transition: 0.3s;
-        }
+        .img-slot { width: 200px; height: 200px; border-radius: var(--radius-lg); overflow: hidden; border: 1px solid var(--border); background: var(--surface); flex-shrink: 0; position: relative; transition: 0.3s; }
         .img-slot:hover { border-color: var(--accent); box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
         .img-slot img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
+        
+        .slot-time-badge { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.6); color: #fff; font-size: 11px; padding: 3px 6px; border-radius: 4px; backdrop-filter: blur(4px); z-index: 5; pointer-events: none; }
 
-        /* loading状态 */
         .img-slot .lp-inner { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
         .img-slot .lp-particles { position: absolute; inset: 0; }
         .img-slot .lp-particle { position: absolute; border-radius: 50%; opacity: 0; animation: particleGather 2.5s ease-in-out infinite; }
         .img-slot .lp-center-glow { width: 60px; height: 60px; border-radius: 50%; background: radial-gradient(circle, rgba(16,185,129,0.3) 0%, transparent 70%); animation: pulseGlow 2s ease-in-out infinite; z-index: 2; }
         .img-slot .lp-text { position: absolute; bottom: 16px; left: 0; right: 0; text-align: center; font-size: 11px; color: var(--text-muted); z-index: 3; }
         .img-slot .lp-ring { position: absolute; width: 80px; height: 80px; border: 2px solid transparent; border-top-color: var(--accent); border-radius: 50%; animation: spin 1.2s linear infinite; z-index: 2; opacity: 0.5; }
-
-        /* 图片上悬浮的下载按钮 */
-        .img-slot .slot-dl-btn {
-            position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
-            border-radius: var(--radius-sm); background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.15);
-            color: #fff; font-size: 16px; cursor: pointer; display: flex; align-items: center;
-            justify-content: center; opacity: 0; transition: 0.2s; backdrop-filter: blur(4px); z-index: 5;
-        }
+        .img-slot .slot-dl-btn { position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px; border-radius: var(--radius-sm); background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.15); color: #fff; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; transition: 0.2s; backdrop-filter: blur(4px); z-index: 5; }
         .img-slot:hover .slot-dl-btn { opacity: 1; }
         .img-slot .slot-dl-btn:hover { background: rgba(16,185,129,0.8); border-color: var(--accent); transform: scale(1.1); }
+        .img-slot .slot-err { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ef4444; font-size: 12px; text-align: center; padding: 20px; line-height: 1.4; }
 
-        /* 失败状态 */
-        .img-slot .slot-err { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ef4444; font-size: 12px; text-align: center; padding: 20px; }
-
-        @keyframes particleGather {
-            0%   { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; }
-            40%  { opacity: 0.8; }
-            70%  { transform: translate(0, 0) scale(1); opacity: 0.6; }
-            85%  { transform: translate(0, 0) scale(0.5); opacity: 0.3; }
-            100% { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; }
-        }
+        @keyframes particleGather { 0% { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; } 40% { opacity: 0.8; } 70% { transform: translate(0, 0) scale(1); opacity: 0.6; } 85% { transform: translate(0, 0) scale(0.5); opacity: 0.3; } 100% { transform: translate(var(--sx), var(--sy)) scale(0.3); opacity: 0; } }
         @keyframes pulseGlow { 0%, 100% { transform: scale(1); opacity: 0.5; } 50% { transform: scale(1.5); opacity: 0.9; } }
 
-        .card-actions { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
-        .card-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer; transition: 0.2s; font-weight: 500; display: flex;align-items: center;justify-content: center;}
-        .card-btn:hover { background: var(--surface-hover); border-color: var(--border-focus); }
-        .err-text { color: #ef4444; font-size: 13px; }
+        .err-text { color: #ef4444; font-size: 13px; margin-top: 10px; display: inline-block; }
 
         .bottom-console-wrapper { position: absolute; bottom: 0; left: 0; width: 100%; padding: 25px 20px; background: linear-gradient(transparent, var(--bg) 90%); display: flex; justify-content: center; z-index: 20; pointer-events: none; }
         .input-console { pointer-events: auto; width: 100%; max-width: 700px; background: rgba(25, 25, 25, 0.75); backdrop-filter: blur(10px);border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,0.8); display: flex; flex-direction: column; padding: 14px 18px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
@@ -351,6 +477,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 
+<div id="confirmModal" class="lightbox-overlay" style="z-index: 10000; display: none; align-items: center; justify-content: center; cursor: default;">
+    <div style="background: var(--surface); padding: 24px; border-radius: var(--radius-md); border: 1px solid var(--border); width: 320px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.8);">
+        <div style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">确定要删除此记录吗？</div>
+        <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">删除后数据将无法恢复 (按 Enter 键确认)</div>
+        <div style="display: flex; gap: 12px; justify-content: center;">
+            <button id="confirmCancelBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: 0.2s;">取消 (Esc)</button>
+            <button id="confirmOkBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: none; background: #ef4444; color: #fff; cursor: pointer; font-weight: 600; transition: 0.2s;">确定删除</button>
+        </div>
+    </div>
+</div>
+
 <div class="lightbox-overlay" id="lightbox" onclick="closeLightbox()">
     <button class="lightbox-close" onclick="closeLightbox()">✕</button>
     <img id="lightboxImg" src="" onclick="event.stopPropagation()">
@@ -365,10 +502,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="icon-btn" style="width:28px; height:28px; font-size:12px;" onclick="toggleSidebar()">✕</button>
     </div>
     <div class="tab-nav">
-        <button class="tab-btn active" onclick="switchTab('history')">图库 (7天)</button>
-        <button class="tab-btn" onclick="switchTab('keys')">Key 轮询池</button>
+        <button class="tab-btn active" onclick="switchTab('sessions')">对话</button>
+        <button class="tab-btn" onclick="switchTab('history')">图库 (7天)</button>
+        <button class="tab-btn" onclick="switchTab('keys')">Key 池</button>
     </div>
-    <div class="tab-content active" id="tab-history">
+    <div class="tab-content active" id="tab-sessions">
+        <button class="new-sess-btn" onclick="createNewSession()">＋ 新建对话</button>
+        <div class="session-list" id="sessionList"></div>
+    </div>
+    <div class="tab-content" id="tab-history">
+        <div class="filter-bar">
+            <button class="filter-btn active" onclick="setGalleryFilter('all')">全部</button>
+            <button class="filter-btn" onclick="setGalleryFilter('upload')">上传</button>
+            <button class="filter-btn" onclick="setGalleryFilter('generate')">生成</button>
+        </div>
         <div class="history-grid" id="historyGrid"></div>
     </div>
     <div class="tab-content" id="tab-keys">
@@ -384,14 +531,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="header-bar">
         <button class="icon-btn-header" onclick="toggleSidebar()">☰</button>
         <span style="font-weight: 600; font-size:16px;">AI Image Studio</span>
-        <div class="key-info-bar" id="keyInfoBar">
-            <span class="dot"></span>
-            <span id="keyInfoText">加载中...</span>
-        </div>
     </div>
 
     <div class="feed-container" id="chatFeed">
-        <div class="feed-placeholder" id="emptyState"></div>
+        <div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>
     </div>
 
     <div class="bottom-console-wrapper">
@@ -431,6 +574,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let MODEL_COSTS = {};
     let MODEL_NAMES = {};
     let attachedUrls = [];
+    
+    // Sessions State
+    let sessionsData = [];
+    let currentSessionId = null;
+    const activePolls = new Set(); 
+    
+    // Gallery State
+    let cachedGalleryData = [];
+    let currentGalleryFilter = 'all';
 
     const RATIO_OPTIONS = [
         {val:'1:1',label:'1:1'},{val:'3:4',label:'3:4'},{val:'4:3',label:'4:3'},
@@ -449,17 +601,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         bindAllSelectEvents();
         restoreSidebar();
         updateCostUI();
-        await loadChatHistory();
-        scrollFeedToBottom();
+        await loadSessionsList();
         loadGallery();
         loadKeys();
-        refreshKeyInfo();
         initScrollTopBtn();
+    };
+
+    // 强力击穿浏览器缓存机制
+    const fetchApi = async (url, options = {}) => {
+        const separator = url.includes('?') ? '&' : '?';
+        const finalUrl = `${url}${separator}t=${Date.now()}`;
+        return fetch(finalUrl, options);
     };
 
     async function loadConfig() {
         try {
-            const res = await fetch('/api/ui_config');
+            const res = await fetchApi('/api/ui_config');
             const cfg = await res.json();
             MODEL_COSTS = cfg.model_costs || {};
             MODEL_NAMES = cfg.model_names || {};
@@ -582,16 +739,152 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function openLightbox(src) { document.getElementById('lightboxImg').src=src; document.getElementById('lightboxUrl').innerText=src; document.getElementById('lightbox').classList.add('active'); }
     function closeLightbox() { document.getElementById('lightbox').classList.remove('active'); }
-    document.addEventListener('keydown', e => { if (e.key==='Escape') closeLightbox(); });
+
+    // ====== 删除二次确认 Modal 逻辑 ======
+    let pendingDeleteId = null;
+    function confirmDeleteCard(cid) {
+        pendingDeleteId = cid;
+        document.getElementById('confirmModal').style.display = 'flex';
+        document.getElementById('confirmOkBtn').focus();
+    }
+    function closeConfirm() {
+        pendingDeleteId = null;
+        document.getElementById('confirmModal').style.display = 'none';
+    }
+    document.getElementById('confirmCancelBtn').addEventListener('click', closeConfirm);
+    document.getElementById('confirmOkBtn').addEventListener('click', () => {
+        if(pendingDeleteId) deleteChatCard(pendingDeleteId);
+        closeConfirm();
+    });
+    
+    document.addEventListener('keydown', e => {
+        const modal = document.getElementById('confirmModal');
+        if (modal && modal.style.display === 'flex') {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if(pendingDeleteId) deleteChatCard(pendingDeleteId);
+                closeConfirm();
+            } else if (e.key === 'Escape') {
+                closeConfirm();
+            }
+        } else if (e.key === 'Escape') {
+            closeLightbox();
+        }
+    });
+
     function scrollFeedToBottom() { const f=document.getElementById('chatFeed'); f.scrollTop=f.scrollHeight; }
     function scrollToTop() { document.getElementById('chatFeed').scrollTo({top:0,behavior:'smooth'}); }
     function initScrollTopBtn() {
         const feed=document.getElementById('chatFeed'), btn=document.getElementById('scrollTopBtn');
         feed.addEventListener('scroll', function() { if(feed.scrollTop>400) btn.classList.add('visible'); else btn.classList.remove('visible'); });
     }
-    async function refreshKeyInfo() {
-        try { const r=await fetch('/api/ui_key_info'); const i=await r.json(); document.querySelector('#keyInfoBar .dot').style.background=i.points>0?'var(--accent)':'#ef4444'; document.getElementById('keyInfoText').innerText=i.key_prefix+'  ·  '+i.points+' 点'; } catch(e) { document.getElementById('keyInfoText').innerText='连接异常'; }
+
+    // ====== 会话(Session)与轮询(Polling)功能 ======
+    async function loadSessionsList() {
+        try {
+            const res = await fetchApi('/api/ui_sessions');
+            sessionsData = await res.json();
+            if (sessionsData.length === 0) {
+                await createNewSession();
+                return;
+            }
+            renderSessionsList();
+            if (!currentSessionId || !sessionsData.find(s => s.id === currentSessionId)) {
+                selectSession(sessionsData[0].id);
+            } else {
+                selectSession(currentSessionId);
+            }
+            
+            sessionsData.forEach(sess => {
+                sess.messages.forEach(msg => {
+                    if (msg.status === 'generating') {
+                        startPolling(sess.id, msg.id);
+                    }
+                });
+            });
+
+        } catch(e) { console.error('Failed to load sessions', e); }
     }
+
+    function renderSessionsList() {
+        const list = document.getElementById('sessionList');
+        list.innerHTML = sessionsData.map(s => `
+            <div class="session-item ${s.id === currentSessionId ? 'active' : ''}" onclick="selectSession('${s.id}')">
+                <div class="session-title" title="${escHtml(s.title)}">${escHtml(s.title)}</div>
+                <div class="session-actions" onclick="event.stopPropagation()">
+                    <button class="sess-btn" onclick="renameSession('${s.id}')" title="重命名">✏️</button>
+                    <button class="sess-btn" onclick="deleteSession('${s.id}')" title="删除">🗑️</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    async function createNewSession() {
+        try {
+            const res = await fetchApi('/api/ui_sessions', { method: 'POST', body: JSON.stringify({action: 'create'})});
+            const newSess = await res.json();
+            sessionsData.unshift(newSess);
+            renderSessionsList();
+            selectSession(newSess.id);
+        } catch(e) { console.error('Create session failed', e); }
+    }
+
+    async function renameSession(id) {
+        const sess = sessionsData.find(s => s.id === id);
+        if(!sess) return;
+        const newName = prompt('请输入新的对话名称：', sess.title);
+        if (newName && newName.trim()) {
+            sess.title = newName.trim();
+            renderSessionsList();
+            await fetchApi('/api/ui_sessions', { method: 'POST', body: JSON.stringify({action: 'rename', id, title: sess.title})});
+        }
+    }
+
+    async function deleteSession(id) {
+        if (!confirm('确定要删除这个对话吗？历史记录将无法恢复。')) return;
+        await fetchApi('/api/ui_sessions', { method: 'DELETE', body: JSON.stringify({id})});
+        sessionsData = sessionsData.filter(s => s.id !== id);
+        if (currentSessionId === id) currentSessionId = null;
+        if (sessionsData.length === 0) {
+            await createNewSession();
+        } else {
+            renderSessionsList();
+            if(!currentSessionId) selectSession(sessionsData[0].id);
+        }
+    }
+
+    function selectSession(id) {
+        currentSessionId = id;
+        renderSessionsList();
+        const sess = sessionsData.find(s => s.id === id);
+        renderChatFeed(sess ? sess.messages : []);
+        if(window.innerWidth <= 768) toggleSidebar();
+    }
+
+    function renderChatFeed(messages) {
+        const feed = document.getElementById('chatFeed');
+        feed.innerHTML = '';
+        if (!messages || messages.length === 0) {
+            feed.innerHTML = '<div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>';
+            return;
+        }
+        messages.forEach(chat => {
+            if (chat.status === 'generating') {
+                renderPendingCard(chat);
+            } else {
+                let ci='';
+                if(chat.status==='success') {
+                    ci=buildResultHTML(chat);
+                } else if(chat.status==='error') {
+                    const errStr = (chat.errors||[]).filter(x=>x).join('; ');
+                    ci='<span class="err-text">'+escHtml(errStr || chat.error || '生成失败')+'</span>';
+                }
+                feed.insertAdjacentHTML('beforeend', buildCardHTML(chat,ci));
+            }
+        });
+        scrollFeedToBottom();
+    }
+
 
     function initDropzone() {
         const dz=document.getElementById('dropzone'); let dc=0;
@@ -608,7 +901,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             document.getElementById('attachmentsQueue').insertAdjacentHTML('beforeend','<div class="attachment-item" id="'+id+'"><div class="upload-spinner"><div class="spinner-small"></div></div></div>');
             reader.onload = async e => {
                 const b64=e.target.result.split(',')[1];
-                try { const r=await fetch('/api/ui_upload',{method:'POST',body:JSON.stringify({image_base64:b64})}); const d=await r.json(); let url=d.url; if(!url&&d.extracted_urls&&d.extracted_urls.length) url=d.extracted_urls[0]; if(r.status===200&&url&&url.startsWith('http')){attachedUrls.push(url);renderAttachmentItem(id,url);} else document.getElementById(id)?.remove(); } catch(err){document.getElementById(id)?.remove();}
+                try { const r=await fetchApi('/api/ui_upload',{method:'POST',body:JSON.stringify({image_base64:b64})}); const d=await r.json(); let url=d.url; if(!url&&d.extracted_urls&&d.extracted_urls.length) url=d.extracted_urls[0]; if(r.status===200&&url&&url.startsWith('http')){attachedUrls.push(url);renderAttachmentItem(id,url);} else document.getElementById(id)?.remove(); } catch(err){document.getElementById(id)?.remove();}
                 resolve();
             }; reader.readAsDataURL(file);
         });
@@ -620,8 +913,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function downloadImage(url,filename) { fetch(url).then(r=>r.blob()).then(blob=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename||'image.jpg'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href); }).catch(()=>window.open(url)); }
     function escHtml(s) { const d=document.createElement('div'); d.innerText=s||''; return d.innerHTML; }
 
-    // ===== 单个slot的loading内容 =====
-    function buildSlotLoading() {
+    function buildSlotLoading(sid) {
         const colors=['#10b981','#34d399','#6ee7b7','#a7f3d0','#059669','#047857','#065f46'];
         let particles='';
         for(let p=0;p<18;p++){
@@ -630,74 +922,155 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const c=colors[Math.floor(Math.random()*colors.length)];
             particles+='<div class="lp-particle" style="left:calc(50% - '+(sz/2)+'px);top:calc(50% - '+(sz/2)+'px);width:'+sz+'px;height:'+sz+'px;background:'+c+';--sx:'+sx+'px;--sy:'+sy+'px;animation-delay:'+delay+'s;animation-duration:'+dur+'s;"></div>';
         }
-        return '<div class="lp-inner"><div class="lp-particles">'+particles+'</div><div class="lp-ring"></div><div class="lp-center-glow"></div><div class="lp-text">Generating...</div></div>';
+        return '<div class="lp-inner"><div class="lp-particles">'+particles+'</div><div class="lp-ring"></div><div class="lp-center-glow"></div><div class="lp-text" id="timer_'+sid+'">0.0s</div></div>';
     }
 
-    // ===== 单个slot渲染为图片 =====
-    function renderSlotImage(slotId, url) {
+    function renderSlotImage(slotId, url, timeTaken) {
         const el = document.getElementById(slotId);
         if (!el) return;
         const su = url.replace(/'/g, "\\'");
         const fname = url.split('/').pop() || 'image.jpg';
+        const timeBadge = timeTaken ? `<div class="slot-time-badge">${timeTaken}s</div>` : '';
         el.innerHTML = '<img src="'+url+'" onclick="openLightbox(\''+su+'\')">' +
+            timeBadge +
             '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button>';
     }
-    function renderSlotError(slotId, msg) {
+    
+    function renderSlotError(slotId, msg, timeTaken) {
         const el = document.getElementById(slotId);
         if (!el) return;
-        el.innerHTML = '<div class="slot-err">'+escHtml(msg)+'</div>';
+        const timeBadge = timeTaken ? `<div class="slot-time-badge">${timeTaken}s</div>` : '';
+        el.innerHTML = timeBadge + '<div class="slot-err">'+escHtml(msg)+'</div>';
     }
 
-    // ===== 历史记录的结果渲染（多图带内嵌下载按钮）=====
-    function buildResultHTML(urls, payload) {
-        const safePayload = encodeURIComponent(JSON.stringify(payload));
-        const imgs = urls.map((u,i) => {
-            const su = u.replace(/'/g, "\\'");
-            const fname = u.split('/').pop() || ('image_'+i+'.jpg');
-            return '<div class="img-slot">' +
-                '<img src="'+u+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
-                '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
-        }).join('');
-        return '<div class="result-grid">'+imgs+'</div>' +
-            '<div class="card-actions"><button class="card-btn" onclick="reuseParams(\''+safePayload+'\')"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAzUlEQVR4nO2VQQrCMBBFs/IGit6lB+wlSmfSVT70CFWwCEq70oUn6DkqkRZtTdqEuMyHgZBM5mUC+REiKlRE6sKM3iE6ZqQANsZCUpY7ZrQ69PgDQO0IGCM1FifCY0zS42+Ii5iRjJ1MFrIMW2bcf0+inkVRHjwh773zyZutXSLVBAOIUC3c5zEY4JWwoghYVQQYxaxO9neE6g8AtAsP9RoMyBasJs+xnwO6ISHxgUhXs9RW62PNRKinENXosDqx/iwGSOcGUGefTqOESS8wqcNLOlNStwAAAABJRU5ErkJggg==" alt="refresh" style="width: 15px;height: 15px;"></button></div>';
+    function buildResultHTML(chatObj) {
+        const urls = chatObj.urls || [];
+        const times = chatObj.times || [];
+        const errors = chatObj.errors || [];
+        const n = chatObj.payload.n || 1;
+        let imgs = '';
+        for(let i=0; i<n; i++) {
+            if (urls[i]) {
+                const su = urls[i].replace(/'/g, "\\'");
+                const fname = urls[i].split('/').pop() || ('image_'+i+'.jpg');
+                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+                imgs += '<div class="img-slot">' +
+                    '<img src="'+urls[i]+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
+                    t +
+                    '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
+            } else if (errors[i]) {
+                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+                imgs += '<div class="img-slot">' + t + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
+            }
+        }
+        return '<div class="result-grid">'+imgs+'</div>';
     }
 
     function buildCardHTML(chatObj, contentInner) {
-        const p=chatObj.payload||{}; const modelLabel=MODEL_NAMES[p.model_id]||p.model_id||'?';
-        let attHtml='';
-        if(p.input_images&&p.input_images.length){ attHtml='<div class="card-attachments">'+p.input_images.map(u=>{const su=u.replace(/'/g,"\\'");return '<img src="'+u+'" onclick="openLightbox(\''+su+'\')">';}).join('')+'</div>'; }
-        const cid=chatObj.id||('tmp_'+Date.now());
+        const p = chatObj.payload || {};
+        const safePayload = encodeURIComponent(JSON.stringify(p));
+        const modelLabel = MODEL_NAMES[p.model_id] || p.model_id || '?';
+        let attHtml = '';
+        if(p.input_images && p.input_images.length){
+            attHtml = '<div class="card-attachments">' + p.input_images.map(u => {
+                const su = u.replace(/'/g, "\\'");
+                return '<img src="'+u+'" onclick="openLightbox(\''+su+'\')">';
+            }).join('') + '</div>';
+        }
+        const cid = chatObj.id || ('tmp_' + Date.now());
+        
+        let keyInfoHtml = '';
+        if (chatObj.key_info && chatObj.key_info.cost > 0) {
+            keyInfoHtml = `
+            <div class="key-inline-info" id="key_info_${cid}">
+                <span title="使用的 Key">🔑 ${escHtml(chatObj.key_info.key)}</span>
+                <span title="消耗点数" style="color: #ef4444;">📉 ${chatObj.key_info.cost}</span>
+                <span title="剩余点数" style="color: var(--accent);">💎 ${chatObj.key_info.remaining}</span>
+            </div>`;
+        }
+
+        const topActionsHtml = `
+            <div class="card-top-actions">
+                <button class="card-icon-btn" onclick="reuseParams('${safePayload}')" title="复用此参数">
+                    <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                </button>
+                <button class="card-icon-btn del-btn" onclick="confirmDeleteCard('${cid}')" title="删除记录">
+                    <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                </button>
+            </div>`;
+
         return '<div class="chat-card" id="'+cid+'">'+
-            '<button class="card-delete-btn" onclick="deleteChatCard(\''+cid+'\')" title="删除此记录">✕</button>'+
-            '<div class="card-header"><div class="avatar">✨</div><div class="prompt-box">'+
-            '<div style="font-size:15px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
-            '<div class="param-tags"><span class="param-tag">'+escHtml(modelLabel)+'</span><span class="param-tag">'+escHtml(p.size||'')+'</span><span class="param-tag">'+escHtml(p.aspect_ratio||'')+'</span><span class="param-tag">'+(p.n||1)+'张</span></div></div></div>'+
+            topActionsHtml +
+            '<div class="card-header"><div class="avatar">✨</div><div class="prompt-box" style="display:flex; flex-direction:column;">'+
+            '<div style="font-size:15px; padding-right: 70px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
+            '<div class="param-tags" id="tags_'+cid+'">'+
+            '<span class="param-tag">'+escHtml(modelLabel)+'</span>'+
+            '<span class="param-tag">'+escHtml(p.size||'')+'</span>'+
+            '<span class="param-tag">'+escHtml(p.aspect_ratio||'')+'</span>'+
+            '<span class="param-tag">'+(p.n||1)+'张</span>'+
+            keyInfoHtml +
+            '</div></div></div>'+
             '<div class="card-content" id="content_'+cid+'">'+contentInner+'</div></div>';
     }
 
-    async function loadChatHistory() {
-        try {
-            const res=await fetch('/api/ui_chats'); const chats=await res.json();
-            if(!chats.length)return;
-            const feed=document.getElementById('chatFeed'); const empty=document.getElementById('emptyState');
-            if(empty) empty.style.display='none';
-            chats.forEach(chat => {
-                let ci='';
-                if(chat.status==='success'&&chat.urls&&chat.urls.length) ci=buildResultHTML(chat.urls,chat.payload);
-                else if(chat.status==='error') ci='<span class="err-text">'+escHtml(chat.error||'生成失败')+'</span>';
-                feed.insertAdjacentHTML('beforeend', buildCardHTML(chat,ci));
-            });
-        } catch(e) { console.error('Load chat failed',e); }
+    function renderPendingCard(chatObj) {
+        const n = chatObj.payload.n || 1;
+        const urls = chatObj.urls || [];
+        const errors = chatObj.errors || [];
+        const times = chatObj.times || [];
+        let slotsHtml = '<div class="result-grid" id="grid_'+chatObj.id+'">';
+        
+        for(let i=0; i<n; i++){
+            const sid = chatObj.id + '_s' + i;
+            if (urls[i]) {
+                const su = urls[i].replace(/'/g, "\\'");
+                const fname = urls[i].split('/').pop() || ('image_'+i+'.jpg');
+                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+                slotsHtml += '<div class="img-slot" id="'+sid+'">' +
+                    '<img src="'+urls[i]+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
+                    t +
+                    '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
+            } else if (errors[i]) {
+                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+                slotsHtml += '<div class="img-slot" id="'+sid+'">' + t + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
+            } else {
+                slotsHtml += '<div class="img-slot" id="'+sid+'">'+buildSlotLoading(sid)+'</div>';
+            }
+        }
+        slotsHtml += '</div>';
+
+        const feed = document.getElementById('chatFeed');
+        if (!document.getElementById(chatObj.id)) {
+            feed.insertAdjacentHTML('beforeend', buildCardHTML(chatObj, slotsHtml));
+        }
+
+        const startTime = chatObj.start_time || (chatObj.created_at * 1000) || Date.now();
+        const timerInt = setInterval(() => {
+            const cardEl = document.getElementById(chatObj.id);
+            if (!cardEl) { clearInterval(timerInt); return; } 
+            for(let i=0; i<n; i++) {
+                const timerEl = document.getElementById('timer_' + chatObj.id + '_s' + i);
+                if (timerEl) {
+                    timerEl.innerText = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
+                }
+            }
+        }, 100);
     }
 
     async function deleteChatCard(chatId) {
         document.getElementById(chatId)?.remove();
-        await fetch('/api/ui_chats',{method:'DELETE',body:JSON.stringify({id:chatId})});
-        const feed=document.getElementById('chatFeed');
-        if(!feed.querySelector('.chat-card')){ let e=document.getElementById('emptyState'); if(!e) feed.insertAdjacentHTML('afterbegin','<div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>'); else e.style.display=''; }
+        await fetchApi('/api/ui_chats', {method:'DELETE', body:JSON.stringify({session_id: currentSessionId, chat_id: chatId})});
+        const sess = sessionsData.find(s => s.id === currentSessionId);
+        if (sess) sess.messages = sess.messages.filter(m => m.id !== chatId);
+
+        const feed = document.getElementById('chatFeed');
+        if(!feed.querySelector('.chat-card')){ 
+            let e = document.getElementById('emptyState'); 
+            if(!e) feed.insertAdjacentHTML('afterbegin','<div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>'); 
+            else e.style.display=''; 
+        }
     }
 
-    // ===== 核心：前端并发生成，逐个返回逐个渲染 =====
     function submitTask() {
         const prompt=document.getElementById('prompt').value.trim();
         const model=document.getElementById('sel-model').dataset.value;
@@ -706,27 +1079,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const n=parseInt(document.getElementById('sel-n').dataset.value);
         if(!model||!MODEL_COSTS[model]) return alert("请先选择模型");
         if(!prompt&&!attachedUrls.length) return alert("请输入创意或上传图片");
-        const empty=document.getElementById('emptyState'); if(empty) empty.style.display='none';
+        if(!currentSessionId) return alert("请先新建对话");
+        
+        const empty=document.getElementById('emptyState'); 
+        if(empty) empty.style.display='none';
 
         const taskType=attachedUrls.length>0?'image_to_image':'text_to_image';
         const payload={type:taskType,prompt,model_id:model,size,aspect_ratio:ratio,n};
         if(taskType==='image_to_image') payload.input_images=[...attachedUrls];
 
         const chatId='chat_'+Date.now();
-        const chatObj={id:chatId,payload:{...payload}};
+        const chatObj={
+            id: chatId,
+            payload: payload,
+            status: 'generating',
+            start_time: Date.now(),
+            created_at: Date.now() / 1000,
+            urls: new Array(n).fill(null),
+            times: new Array(n).fill(null),
+            errors: new Array(n).fill(null)
+        };
 
-        // 构建n个独立的slot
-        const slotIds=[];
-        let slotsHtml='<div class="result-grid" id="grid_'+chatId+'">';
-        for(let i=0;i<n;i++){
-            const sid=chatId+'_s'+i;
-            slotIds.push(sid);
-            slotsHtml+='<div class="img-slot" id="'+sid+'">'+buildSlotLoading()+'</div>';
-        }
-        slotsHtml+='</div><div class="card-actions" id="actions_'+chatId+'"></div>';
+        const sess = sessionsData.find(s => s.id === currentSessionId);
+        if (sess) sess.messages.push(chatObj);
 
-        const feed=document.getElementById('chatFeed');
-        feed.insertAdjacentHTML('beforeend', buildCardHTML(chatObj, slotsHtml));
+        renderPendingCard(chatObj);
         scrollFeedToBottom();
 
         document.getElementById('prompt').value='';
@@ -734,63 +1111,85 @@ HTML_PAGE = r"""<!DOCTYPE html>
         clearAllAttachments();
         saveSettings();
 
-        // 并发发送n个独立请求
-        executeParallelGeneration(chatId, payload, slotIds);
+        fetchApi('/api/ui_chats', {method: 'POST', body: JSON.stringify({session_id: currentSessionId, message: chatObj})})
+        .then(() => {
+            return fetchApi('/api/ui_generate_async', {
+                method: 'POST', 
+                body: JSON.stringify({session_id: currentSessionId, chat_id: chatId, payload})
+            });
+        })
+        .then(() => {
+            startPolling(currentSessionId, chatId);
+        });
     }
 
-    async function executeParallelGeneration(chatId, payload, slotIds) {
-        const n = slotIds.length;
-        const results = new Array(n).fill(null); // {url:..} or {error:..}
-        let doneCount = 0;
+    function startPolling(sessId, chatId) {
+        if (activePolls.has(chatId)) return;
+        activePolls.add(chatId);
 
-        const singlePayload = {...payload, n: 1};
-
-        const promises = slotIds.map((sid, index) => {
-            return fetch('/api/ui_generate', {method:'POST', body:JSON.stringify(singlePayload)})
-                .then(r => r.json().then(data => ({status: r.status, data})))
-                .then(({status, data}) => {
-                    if (status === 200 && data.extracted_urls && data.extracted_urls.length) {
-                        const url = data.extracted_urls[0];
-                        results[index] = {url};
-                        renderSlotImage(sid, url);
-                    } else {
-                        const err = data.error || '未获取到图片';
-                        results[index] = {error: err};
-                        renderSlotError(sid, err);
+        const intId = setInterval(async () => {
+            try {
+                const res = await fetchApi(`/api/ui_chat_status?session_id=${sessId}&chat_id=${chatId}`);
+                if (res.status === 200) {
+                    const data = await res.json();
+                    
+                    const sess = sessionsData.find(s => s.id === sessId);
+                    if (sess) {
+                        const idx = sess.messages.findIndex(m => m.id === data.id);
+                        if (idx !== -1) sess.messages[idx] = data;
                     }
-                })
-                .catch(e => {
-                    results[index] = {error: '网络错误: '+e.message};
-                    renderSlotError(sid, '网络错误');
-                })
-                .finally(() => {
-                    doneCount++;
-                    scrollFeedToBottom();
-                    if (doneCount === n) onAllDone();
-                });
-        });
 
-        async function onAllDone() {
-            const urls = results.filter(r => r && r.url).map(r => r.url);
-            const errors = results.filter(r => r && r.error).map(r => r.error);
+                    if (currentSessionId === sessId) {
+                        const n = data.payload.n || 1;
+                        let anyNew = false;
+                        
+                        for(let i=0; i<n; i++) {
+                            const sid = data.id + '_s' + i;
+                            const slotEl = document.getElementById(sid);
+                            if (slotEl && slotEl.querySelector('.lp-inner')) { 
+                                if (data.urls && data.urls[i]) {
+                                    renderSlotImage(sid, data.urls[i], data.times ? data.times[i] : null);
+                                    anyNew = true;
+                                } else if (data.errors && data.errors[i]) {
+                                    renderSlotError(sid, data.errors[i], data.times ? data.times[i] : null);
+                                    anyNew = true;
+                                }
+                            }
+                        }
 
-            // 添加复用按钮
-            const actionsDiv = document.getElementById('actions_'+chatId);
-            if (actionsDiv) {
-                const safePayload = encodeURIComponent(JSON.stringify(payload));
-                actionsDiv.innerHTML = '<button class="card-btn" onclick="reuseParams(\''+safePayload+'\')"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAzUlEQVR4nO2VQQrCMBBFs/IGit6lB+wlSmfSVT70CFWwCEq70oUn6DkqkRZtTdqEuMyHgZBM5mUC+REiKlRE6sKM3iE6ZqQANsZCUpY7ZrQ69PgDQO0IGCM1FifCY0zS42+Ii5iRjJ1MFrIMW2bcf0+inkVRHjwh773zyZutXSLVBAOIUC3c5zEY4JWwoghYVQQYxaxO9neE6g8AtAsP9RoMyBasJs+xnwO6ISHxgUhXs9RW62PNRKinENXosDqx/iwGSOcGUGefTqOESS8wqcNLOlNStwAAAABJRU5ErkJggg==" alt="refresh" style="width: 15px;height: 15px;"></button>';
-            }
-
-            // 保存聊天记录
-            const chatData = {
-                id: chatId, payload, urls,
-                status: urls.length > 0 ? 'success' : 'error',
-                error: urls.length === 0 ? errors.join('; ') : undefined,
-                created_at: Date.now()/1000
-            };
-            await fetch('/api/ui_chats', {method:'POST', body:JSON.stringify(chatData)});
-            loadGallery(); refreshKeyInfo(); loadKeys();
-        }
+                        if (data.status !== 'generating') {
+                            clearInterval(intId);
+                            activePolls.delete(chatId);
+                            
+                            const oldCard = document.getElementById(data.id);
+                            if (oldCard) {
+                                let ci='';
+                                if(data.status === 'success') {
+                                    ci = buildResultHTML(data);
+                                } else {
+                                    const errStr = (data.errors||[]).filter(x=>x).join('; ');
+                                    ci = '<span class="err-text">'+escHtml(errStr || data.error || '生成失败')+'</span>';
+                                }
+                                oldCard.outerHTML = buildCardHTML(data, ci);
+                            }
+                            loadGallery();
+                            loadKeys();
+                        } else if (anyNew) {
+                            loadGallery();
+                            loadKeys();
+                        }
+                    } else {
+                        if (data.status !== 'generating') {
+                            clearInterval(intId);
+                            activePolls.delete(chatId);
+                        }
+                    }
+                } else if (res.status === 404) {
+                    clearInterval(intId);
+                    activePolls.delete(chatId);
+                }
+            } catch(e) {}
+        }, 2000);
     }
 
     function reuseParams(encoded) {
@@ -804,21 +1203,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
         } catch(e) { console.error('Reuse failed',e); }
     }
 
+    function setGalleryFilter(type) {
+        currentGalleryFilter = type;
+        document.querySelectorAll('#tab-history .filter-btn').forEach(b => {
+            b.classList.remove('active');
+            if (
+                (type === 'all' && b.innerText === '全部') ||
+                (type === 'upload' && b.innerText === '上传') ||
+                (type === 'generate' && b.innerText === '生成')
+            ) { b.classList.add('active'); }
+        });
+        renderGalleryItems();
+    }
+
     async function loadGallery() {
         try {
-            const res=await fetch('/api/ui_history'); const data=await res.json();
-            document.getElementById('historyGrid').innerHTML=data.map(item=>{
-                const tag=item.type==='upload'?'📤':'🎨'; const su=(item.url||'').replace(/'/g,"\\'"); const si=(item.id||'').replace(/'/g,"\\'");
-                return '<div class="history-item"><img src="'+item.url+'" loading="lazy" onclick="openLightbox(\''+su+'\')"/><span class="tag">'+tag+'</span><div class="hist-actions"><button class="hist-act-btn hist-use-btn" onclick="event.stopPropagation();appendToAttachments(\''+su+'\')" title="添加到输入框">＋</button><button class="hist-act-btn hist-del-btn" onclick="event.stopPropagation();deleteGalleryItem(\''+si+'\')" title="删除">✕</button></div></div>';
-            }).join('');
+            const res = await fetchApi('/api/ui_history');
+            cachedGalleryData = await res.json();
+            renderGalleryItems();
         } catch(e) {}
     }
-    async function deleteGalleryItem(id) { if(!id)return; await fetch('/api/ui_history',{method:'DELETE',body:JSON.stringify({id})}); loadGallery(); }
-    async function loadKeys() {
-        try { const r=await fetch('/api/ui_keys'); const keys=await r.json(); document.getElementById('keyList').innerHTML=keys.map(k=>'<div class="key-item"><span style="color:var(--text-muted);">'+k.key.substring(0,12)+'...</span><div><strong style="color:var(--accent);">'+k.points+' 点</strong><button style="background:none;border:none;color:#ef4444;cursor:pointer;margin-left:12px;" onclick="deleteKey(\''+k.key+'\')">✕</button></div></div>').join(''); } catch(e) {}
+
+    function renderGalleryItems() {
+        const data = cachedGalleryData.filter(item => {
+            if (currentGalleryFilter === 'upload') return item.type === 'upload';
+            if (currentGalleryFilter === 'generate') return item.type !== 'upload';
+            return true;
+        });
+
+        document.getElementById('historyGrid').innerHTML = data.map(item => {
+            const tag = item.type === 'upload' ? '📤' : '🎨'; 
+            const su = (item.url || '').replace(/'/g, "\\'"); 
+            const si = (item.id || '').replace(/'/g, "\\'");
+            return '<div class="history-item"><img src="'+item.url+'" loading="lazy" onclick="openLightbox(\''+su+'\')"/><span class="tag">'+tag+'</span><div class="hist-actions"><button class="hist-act-btn hist-use-btn" onclick="event.stopPropagation();appendToAttachments(\''+su+'\')" title="添加到输入框">＋</button><button class="hist-act-btn hist-del-btn" onclick="event.stopPropagation();deleteGalleryItem(\''+si+'\')" title="删除">✕</button></div></div>';
+        }).join('');
     }
-    async function addKey() { const k=document.getElementById('newKey').value.trim(); if(!k)return; await fetch('/api/ui_keys',{method:'POST',body:JSON.stringify({key:k})}); document.getElementById('newKey').value=''; loadKeys(); refreshKeyInfo(); }
-    async function deleteKey(k) { await fetch('/api/ui_keys',{method:'DELETE',body:JSON.stringify({key:k})}); loadKeys(); refreshKeyInfo(); }
+
+    async function deleteGalleryItem(id) { if(!id)return; await fetchApi('/api/ui_history',{method:'DELETE',body:JSON.stringify({id})}); loadGallery(); }
+    async function loadKeys() {
+        try { const r=await fetchApi('/api/ui_keys'); const keys=await r.json(); document.getElementById('keyList').innerHTML=keys.map(k=>'<div class="key-item"><span class="key-item-str">'+k.key+'</span><div style="flex-shrink:0;"><strong style="color:var(--accent);">'+k.points+' 点</strong><button style="background:none;border:none;color:#ef4444;cursor:pointer;margin-left:12px;" onclick="deleteKey(\''+k.key+'\')">✕</button></div></div>').join(''); } catch(e) {}
+    }
+    async function addKey() { const k=document.getElementById('newKey').value.trim(); if(!k)return; await fetchApi('/api/ui_keys',{method:'POST',body:JSON.stringify({key:k})}); document.getElementById('newKey').value=''; loadKeys(); }
+    async function deleteKey(k) { await fetchApi('/api/ui_keys',{method:'DELETE',body:JSON.stringify({key:k})}); loadKeys(); }
 </script>
 </body>
 </html>"""
@@ -830,7 +1256,12 @@ class UIProxyHandler(BaseHTTPRequestHandler):
     def _send(self, status, payload=None, ctype='application/json'):
         self.send_response(status)
         self.send_header('Content-type', ctype)
+        # 强制击穿浏览器缓存机制
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
+        
         if payload is not None:
             if 'json' in ctype:
                 self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
@@ -848,9 +1279,20 @@ class UIProxyHandler(BaseHTTPRequestHandler):
         if path == "/": self._send(200, HTML_PAGE, 'text/html; charset=utf-8')
         elif path == "/api/ui_keys": self._send(200, load_json(KEYS_FILE, []))
         elif path == "/api/ui_history": self._send(200, clean_and_load_history())
-        elif path == "/api/ui_chats": self._send(200, load_chat_history())
+        elif path == "/api/ui_sessions": self._send(200, load_sessions())
         elif path == "/api/ui_config": self._send(200, {"model_costs": MODEL_COSTS, "model_names": MODEL_DISPLAY_NAMES})
-        elif path == "/api/ui_key_info": self._send(200, get_current_key_info())
+        elif path == "/api/ui_chat_status":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sess_id = query.get("session_id", [None])[0]
+            chat_id = query.get("chat_id", [None])[0]
+            if sess_id and chat_id:
+                sessions = load_sessions()
+                for s in sessions:
+                    if s["id"] == sess_id:
+                        for m in s["messages"]:
+                            if m["id"] == chat_id:
+                                return self._send(200, m)
+            return self._send(404, {"error": "Not found"})
         else: self._send(404, {"error": "Not found"})
 
     def do_DELETE(self):
@@ -866,8 +1308,22 @@ class UIProxyHandler(BaseHTTPRequestHandler):
         elif path == "/api/ui_history":
             if data and data.get("id"): delete_history_item(data["id"])
             self._send(200, {"status": "ok"})
+        elif path == "/api/ui_sessions":
+            if data and data.get("id"):
+                sessions = load_sessions()
+                sessions = [s for s in sessions if s["id"] != data["id"]]
+                save_sessions(sessions)
+            self._send(200, {"status": "ok"})
         elif path == "/api/ui_chats":
-            if data and data.get("id"): delete_chat_record(data["id"])
+            sess_id = data.get("session_id")
+            chat_id = data.get("chat_id")
+            if sess_id and chat_id:
+                sessions = load_sessions()
+                for s in sessions:
+                    if s["id"] == sess_id:
+                        s["messages"] = [m for m in s["messages"] if m.get("id") != chat_id]
+                        break
+                save_sessions(sessions)
             self._send(200, {"status": "ok"})
         else: self._send(404, {"error": "Not found"})
 
@@ -886,43 +1342,61 @@ class UIProxyHandler(BaseHTTPRequestHandler):
                         save_json(KEYS_FILE, keys)
             return self._send(200, {"status": "ok"})
 
+        elif path == "/api/ui_sessions":
+            action = data.get("action")
+            if action == "create":
+                return self._send(200, create_session())
+            elif action == "rename":
+                sess_id = data.get("id")
+                title = data.get("title")
+                if sess_id and title:
+                    sessions = load_sessions()
+                    for s in sessions:
+                        if s["id"] == sess_id:
+                            s["title"] = title
+                            break
+                    save_sessions(sessions)
+                return self._send(200, {"status": "ok"})
+
         elif path == "/api/ui_chats":
-            if data and data.get("id"): save_chat_record(data)
+            sess_id = data.get("session_id")
+            msg = data.get("message")
+            if sess_id and msg:
+                with FILE_LOCK:
+                    sessions = load_sessions()
+                    for s in sessions:
+                        if s["id"] == sess_id:
+                            idx = next((i for i, m in enumerate(s["messages"]) if m["id"] == msg["id"]), -1)
+                            if idx != -1:
+                                s["messages"][idx] = msg
+                            else:
+                                s["messages"].append(msg)
+                            break
+                    save_sessions(sessions)
             return self._send(200, {"status": "ok"})
 
-        elif path == "/api/ui_generate":
-            task_type = data.pop("type", "text_to_image")
-            model = data.get("model_id")
-            size = data.get("size")
-            n = int(data.get("n", 1))
+        elif path == "/api/ui_generate_async":
+            sess_id = data.get("session_id")
+            chat_id = data.get("chat_id")
+            payload = data.get("payload", {})
+            n = int(payload.get("n", 1))
 
-            # 每次请求扣单张费用（前端并发n次，每次n=1）
-            single_cost = calculate_cost(model, size, 1)
-            api_key = get_available_key(single_cost)
-            if not api_key:
-                return self._send(400, {"error": f"点数不足！需要 {single_cost} 点，无可用Key。"})
-
-            endpoint = "/v1/images/generations" if task_type == "text_to_image" else "/v1/images/edits"
-            data["n"] = 1  # 强制单张
-            res_data, status = call_backend(endpoint, data, api_key)
-
-            if "extracted_urls" not in res_data:
-                urls = extract_urls_and_parse(res_data)
-                res_data["extracted_urls"] = urls
-            else:
-                urls = res_data["extracted_urls"]
-
-            if urls:
-                save_history([{"type": task_type, "url": u} for u in urls])
-                status = 200
-
-            return self._send(status, res_data)
+            t = threading.Thread(target=background_generation, args=(sess_id, chat_id, payload, n))
+            t.daemon = True
+            t.start()
+            
+            return self._send(200, {"status": "started"})
 
         elif path == "/api/ui_upload":
-            api_key = get_available_key(0)
+            api_key, _ = get_available_key(0)
             if not api_key: return self._send(400, {"error": "缺少 API Key 配置"})
             res_data, status = call_backend("/v1/images/upload", data, api_key)
             urls = extract_urls_and_parse(res_data)
+            
+            # --- 新增：拦截特定的错误 URL ---
+            if urls and TARGET_ERROR_URL in urls:
+                return self._send(400, {"error": "云端API KEY过期或点数不足"})
+                
             res_data["extracted_urls"] = urls
             res_data["url"] = urls[0] if urls else None
             if urls: save_history([{"type": "upload", "url": urls[0]}])
@@ -931,6 +1405,8 @@ class UIProxyHandler(BaseHTTPRequestHandler):
         else: self._send(404, {"error": "Not found"})
 
 if __name__ == '__main__':
+    migrate_old_chats()
+    cleanup_ghost_tasks()
     server = ThreadingHTTPServer(('0.0.0.0', UI_PORT), UIProxyHandler)
     print(f"🚀 [AI Image Studio] 代理服务已启动！")
     print(f"👉 访问地址: http://127.0.0.1:{UI_PORT}")
