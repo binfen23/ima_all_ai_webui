@@ -114,7 +114,7 @@ class ImageAPIHandler(BaseHTTPRequestHandler):
         extra_params = json.dumps({"n": n, "aspect_ratio": aspect_ratio})
         
         cmd =[
-            "python", "ima_create.py",
+            "python", "ima_image_create.py",
             "--api-key", api_key,
             "--task-type", "text_to_image",
             "--model-id", model_id,
@@ -143,7 +143,7 @@ class ImageAPIHandler(BaseHTTPRequestHandler):
         extra_params = json.dumps({"n": n, "aspect_ratio": aspect_ratio})
         
         cmd =[
-            "python", "ima_create.py",
+            "python", "ima_image_create.py",
             "--api-key", api_key,
             "--task-type", "image_to_image",
             "--model-id", model_id,
