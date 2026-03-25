@@ -32,7 +32,7 @@ MODEL_DISPLAY_NAMES = {
 
 SEVEN_DAYS_SEC = 7 * 24 * 3600
 # 需要拦截的伪装成成功的无效链接
-TARGET_ERROR_URL = "https://api.imastudio.com/open/v1/tasks/create"
+TARGET_ERROR_URL = ["https://api.imastudio.com/open/v1/tasks/create","https://api.imastudio.com/open/v1/product/list?app=ima&platform=web&category=image_to_image"]
 
 # ================= 核心工具 =================
 def load_json(filename, default_val):
@@ -115,15 +115,6 @@ def delete_history_item(item_id):
         history = [h for h in history if h.get("id") != item_id]
         save_json(HISTORY_FILE, history)
 
-def migrate_old_chats():
-    with FILE_LOCK:
-        if os.path.exists("chat_history.json") and not os.path.exists(SESSIONS_FILE):
-            old_chats = load_json("chat_history.json", [])
-            if old_chats:
-                now = time.time()
-                title = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
-                new_sess = {"id": f"sess_migrated_{int(now*1000)}", "title": f"旧数据迁移 {title}", "created_at": now, "messages": old_chats}
-                save_json(SESSIONS_FILE, [new_sess])
 
 def load_sessions():
     with FILE_LOCK:
@@ -154,6 +145,11 @@ def cleanup_ghost_tasks():
                     msg["error"] = "CLI 服务中断"
                     
                     n = msg.get("payload", {}).get("n", 1)
+                    if not msg.get("urls"): msg["urls"] = [None] * n
+                    if not msg.get("times"): msg["times"] = [None] * n
+                    if not msg.get("keys"): msg["keys"] = [None] * n
+                    if not msg.get("costs"): msg["costs"] = [None] * n
+                    if not msg.get("remains"): msg["remains"] = [None] * n
                     msg["errors"] = ["CLI 服务中断"] * n
                     
                     ghost_count += 1
@@ -238,10 +234,10 @@ def single_generation(payload, cost_per_image, index):
     else:
         urls = res_data["extracted_urls"]
         
-    # --- 新增：精准拦截点数耗尽的假链接 ---
-    if urls and TARGET_ERROR_URL in urls:
+    # --- 拦截点数耗尽的假链接 ---
+    if urls and any(target in urls for target in TARGET_ERROR_URL):
         refund_key(api_key, cost_per_image) # 退还预扣的点数
-        return {"error": "云端API KEY过期或点数不足", "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
+        return {"error": "云端API KEY 过期、无效或点数不足", "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
 
     if urls:
         return {"url": urls[0], "time": time_taken, "cost": cost_per_image, "key": api_key, "remain": remaining, "index": index}
@@ -254,9 +250,6 @@ def single_generation(payload, cost_per_image, index):
 
 def background_generation(session_id, chat_id, payload, n):
     cost_per_image = calculate_cost(payload.get("model_id"), payload.get("size"), 1)
-    total_cost = 0
-    last_key = ""
-    last_remain = 0
     completed_count = 0
     
     # 多线程并发，独立插槽更新
@@ -276,23 +269,25 @@ def background_generation(session_id, chat_id, payload, n):
                                 if not msg.get("urls"): msg["urls"] = [None] * n
                                 if not msg.get("times"): msg["times"] = [None] * n
                                 if not msg.get("errors"): msg["errors"] = [None] * n
+                                if not msg.get("keys"): msg["keys"] = [None] * n
+                                if not msg.get("costs"): msg["costs"] = [None] * n
+                                if not msg.get("remains"): msg["remains"] = [None] * n
                                 
                                 msg["times"][idx] = res["time"]
+                                msg["keys"][idx] = res.get("key", "")
+                                msg["costs"][idx] = res.get("cost", 0)
+                                msg["remains"][idx] = res.get("remain", 0)
+                                
                                 if "url" in res:
                                     msg["urls"][idx] = res["url"]
-                                    total_cost += res["cost"]
-                                    last_key = res["key"]
-                                    last_remain = res["remain"]
                                 else:
                                     msg["errors"][idx] = res["error"]
                                     
                                 completed_count += 1
                                 if completed_count == n:
-                                    # 全局完成，检查是否有任何成功的
+                                    # 全局完成，检查状态
                                     has_success = any(u for u in msg["urls"] if u is not None)
                                     msg["status"] = "success" if has_success else "error"
-                                    if total_cost > 0:
-                                        msg["key_info"] = {"key": last_key, "cost": total_cost, "remaining": last_remain}
                                 break
                         break
                 save_sessions(sessions)
@@ -368,7 +363,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .hist-del-btn { background: rgba(239,68,68,0.85); color: #fff; }
 
         .workspace { flex: 1; display: flex; flex-direction: column; position: relative; background: var(--bg); }
-        .header-bar { padding: 15px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 15px; background: rgba(9,9,11,0.85); backdrop-filter: blur(10px); z-index: 5; position: absolute; width: 100%; }
+        .header-bar { padding: 15px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 15px; background: rgba(9,9,11,0.85); backdrop-filter: blur(10px); z-index: 50; position: absolute; width: 100%; }
         .icon-btn-header { background: transparent; border: none; color: var(--text); cursor: pointer; font-size: 18px; padding: 5px; border-radius: var(--radius-sm); }
         .icon-btn-header:hover { background: var(--surface); }
 
@@ -394,9 +389,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .param-tags { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; width: 100%; align-items: center; }
         .param-tag { background: var(--bg); color: var(--text-muted); font-size: 11px; padding: 4px 10px; border-radius: 20px; border: 1px solid var(--border); }
         
-        .key-inline-info { margin-left: auto; display: flex; gap: 14px; font-size: 12px; color: var(--text-muted); align-items: center; padding: 2px 4px; font-family: monospace; }
-        .key-inline-info span { display: flex; align-items: center; gap: 5px; }
-
         .card-content { margin-left: 48px; }
 
         .result-grid { display: flex; flex-wrap: wrap; gap: 15px; }
@@ -405,6 +397,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .img-slot img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
         
         .slot-time-badge { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,0.6); color: #fff; font-size: 11px; padding: 3px 6px; border-radius: 4px; backdrop-filter: blur(4px); z-index: 5; pointer-events: none; }
+        
+        /* 悬浮显示的卡片左下角 Key 徽章 */
+        .slot-key-badge { position: absolute; bottom: 5px; left: 5px; height: 30px; display: flex; align-items: center; background: rgba(0,0,0,0.75); font-size: 11px; padding: 0 8px; border-radius: var(--radius-sm); backdrop-filter: blur(4px); z-index: 5; font-family: monospace; border: 1px solid rgba(255,255,255,0.15); opacity: 0; transition: 0.2s; white-space: nowrap; pointer-events: none; }
+        .img-slot:hover .slot-key-badge { opacity: 1; }
 
         .img-slot .lp-inner { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
         .img-slot .lp-particles { position: absolute; inset: 0; }
@@ -465,25 +461,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .lightbox-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 9999; display: none; flex-direction: column; align-items: center; justify-content: center; cursor: zoom-out; animation: lbFadeIn 0.2s; }
         .lightbox-overlay.active { display: flex; }
         @keyframes lbFadeIn { from { opacity: 0; } to { opacity: 1; } }
-        .lightbox-overlay img { max-width: 92vw; max-height: 85vh; object-fit: contain; border-radius: 8px; box-shadow: 0 0 60px rgba(0,0,0,0.8); cursor: default; }
-        .lightbox-url { margin-top: 12px; font-size: 11px; color: rgba(255,255,255,0.25); max-width: 90vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; cursor: text; }
+        .lightbox-overlay img { max-width: 92vw; max-height: 80vh; object-fit: contain; border-radius: 8px; box-shadow: 0 0 60px rgba(0,0,0,0.8); cursor: default; }
+        .lightbox-url { margin-top: 12px; font-size: 11px; color: rgba(255,255,255,0.4); max-width: 90vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; cursor: text; }
+        
+        /* 全新的极简 Lightbox Key 信息药丸设计 */
+        .lightbox-key { margin-top: 10px; font-size: 13px; display: none; align-items: center; gap: 14px; background: rgba(24,24,27,0.85); padding: 8px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border); box-shadow: 0 4px 12px rgba(0,0,0,0.5); backdrop-filter: blur(4px); }
+        
         .lightbox-close { position: absolute; top: 20px; right: 28px; background: none; border: none; color: #fff; font-size: 32px; cursor: pointer; opacity: 0.7; transition: 0.2s; }
         .lightbox-close:hover { opacity: 1; transform: scale(1.1); }
 
         .scroll-top-btn { position: fixed; bottom: 24px; right: 24px; width: 40px; height: 40px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 18px; cursor: pointer; z-index: 35; display: none; align-items: center; justify-content: center; transition: 0.2s; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
         .scroll-top-btn:hover { background: var(--surface-hover); color: var(--text); border-color: var(--border-focus); transform: translateY(-2px); }
         .scroll-top-btn.visible { display: flex; }
+        
+        #promptInput:focus { border-color: var(--accent) !important; }
     </style>
 </head>
 <body>
 
 <div id="confirmModal" class="lightbox-overlay" style="z-index: 10000; display: none; align-items: center; justify-content: center; cursor: default;">
     <div style="background: var(--surface); padding: 24px; border-radius: var(--radius-md); border: 1px solid var(--border); width: 320px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.8);">
-        <div style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">确定要删除此记录吗？</div>
-        <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">删除后数据将无法恢复 (按 Enter 键确认)</div>
+        <div id="confirmTitle" style="font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text);">确定要删除此记录吗？</div>
+        <div id="confirmMsg" style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">删除后数据将无法恢复</div>
         <div style="display: flex; gap: 12px; justify-content: center;">
-            <button id="confirmCancelBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: 0.2s;">取消 (Esc)</button>
+            <button id="confirmCancelBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: 0.2s;">取消</button>
             <button id="confirmOkBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: none; background: #ef4444; color: #fff; cursor: pointer; font-weight: 600; transition: 0.2s;">确定删除</button>
+        </div>
+    </div>
+</div>
+
+<div id="promptModal" class="lightbox-overlay" style="z-index: 10000; display: none; align-items: center; justify-content: center; cursor: default;">
+    <div style="background: var(--surface); padding: 24px; border-radius: var(--radius-md); border: 1px solid var(--border); width: 320px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.8);">
+        <div id="promptTitle" style="font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--text);">重命名</div>
+        <input type="text" id="promptInput" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 12px; border-radius: var(--radius-sm); outline: none; margin-bottom: 24px; box-sizing: border-box; font-size: 14px;" autocomplete="off">
+        <div style="display: flex; gap: 12px; justify-content: center;">
+            <button id="promptCancelBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; transition: 0.2s;">取消</button>
+            <button id="promptOkBtn" style="flex: 1; padding: 10px; border-radius: var(--radius-sm); border: none; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; transition: 0.2s;">确定 (Enter)</button>
         </div>
     </div>
 </div>
@@ -492,6 +505,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="lightbox-close" onclick="closeLightbox()">✕</button>
     <img id="lightboxImg" src="" onclick="event.stopPropagation()">
     <div class="lightbox-url" id="lightboxUrl" onclick="event.stopPropagation()"></div>
+    <div class="lightbox-key" id="lightboxKey" onclick="event.stopPropagation()"></div>
 </div>
 
 <button class="scroll-top-btn" id="scrollTopBtn" onclick="scrollToTop()" title="回到顶部"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAyklEQVR4nO3WSwrCMBAG4DmOC13Zpe4t3rH5p92YiaeqotRLKFGUIrVJa2pRMzA0JAMfQx6UKMbfhVKyZpY9s5xDJKB3gEmdsC0MhdaydMIDoNekCH8VDOgKkDmzSez4U/Apy2R2r1dqOwH0YVAY0FWeb6a2zn7rY1fn9Ab86NR2ySzH57m2zqkn3IQ2rr3CqQfchnrj1BW2p9dnH+v7b097iI4XvtfmVmOSojDLQe4xj/WAcIQ5wtIdxli/PoBJA+OlUrJywjF+Li4Ur0SlSNbYGwAAAABJRU5ErkJggg==" alt="up-squared" style="width: 20px;height: 20px;"></button>
@@ -503,8 +517,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="tab-nav">
         <button class="tab-btn active" onclick="switchTab('sessions')">对话</button>
-        <button class="tab-btn" onclick="switchTab('history')">图库 (7天)</button>
-        <button class="tab-btn" onclick="switchTab('keys')">Key 池</button>
+        <button class="tab-btn" onclick="switchTab('history')">图库</button>
+        <button class="tab-btn" onclick="switchTab('keys')">Api Key池</button>
     </div>
     <div class="tab-content active" id="tab-sessions">
         <button class="new-sess-btn" onclick="createNewSession()">＋ 新建对话</button>
@@ -530,11 +544,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <main class="workspace">
     <div class="header-bar">
         <button class="icon-btn-header" onclick="toggleSidebar()">☰</button>
-        <span style="font-weight: 600; font-size:16px;">AI Image Studio</span>
+        <span style="font-weight: 600; font-size:16px;">Image Studio WebUI</span>
     </div>
 
     <div class="feed-container" id="chatFeed">
-        <div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>
+        <div class="feed-placeholder" id="emptyState"></div>
     </div>
 
     <div class="bottom-console-wrapper">
@@ -737,40 +751,99 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
     }
 
-    function openLightbox(src) { document.getElementById('lightboxImg').src=src; document.getElementById('lightboxUrl').innerText=src; document.getElementById('lightbox').classList.add('active'); }
+    function openLightbox(src, keyStr, cost, remain) { 
+        document.getElementById('lightboxImg').src = src; 
+        document.getElementById('lightboxUrl').innerText = src; 
+        
+        const keyInfoEl = document.getElementById('lightboxKey');
+        if (keyStr) {
+            const cNum = parseInt(cost) || 0;
+            const rNum = parseInt(remain) || 0;
+            const costHtml = cNum > 0 ? `<span style="color: #ef4444; font-weight: 600;">-${cNum}</span>` : '';
+            const remainHtml = `<span style="color: var(--accent); font-weight: 600;">${rNum}</span>`;
+
+            keyInfoEl.innerHTML = `<span style="color: #a1a1aa; font-family: monospace; user-select: all; cursor: text;">${escHtml(keyStr)}</span>` +
+                                  (costHtml ? `<span>${costHtml}</span>` : '') +
+                                  `<span>${remainHtml}</span>`;
+            keyInfoEl.style.display = 'flex';
+        } else {
+            keyInfoEl.style.display = 'none';
+        }
+        
+        document.getElementById('lightbox').classList.add('active'); 
+    }
+    
     function closeLightbox() { document.getElementById('lightbox').classList.remove('active'); }
 
-    // ====== 删除二次确认 Modal 逻辑 ======
-    let pendingDeleteId = null;
-    function confirmDeleteCard(cid) {
-        pendingDeleteId = cid;
+    // ====== 统一弹窗与事件管理 ======
+    let pendingConfirmAction = null;
+    function showConfirm(title, message, actionFn) {
+        document.getElementById('confirmTitle').innerText = title;
+        document.getElementById('confirmMsg').innerText = message;
+        pendingConfirmAction = actionFn;
         document.getElementById('confirmModal').style.display = 'flex';
         document.getElementById('confirmOkBtn').focus();
     }
     function closeConfirm() {
-        pendingDeleteId = null;
+        pendingConfirmAction = null;
         document.getElementById('confirmModal').style.display = 'none';
     }
     document.getElementById('confirmCancelBtn').addEventListener('click', closeConfirm);
     document.getElementById('confirmOkBtn').addEventListener('click', () => {
-        if(pendingDeleteId) deleteChatCard(pendingDeleteId);
+        if(pendingConfirmAction) pendingConfirmAction();
         closeConfirm();
+    });
+
+    let pendingPromptAction = null;
+    function showCustomPrompt(title, defaultVal, actionFn) {
+        document.getElementById('promptTitle').innerText = title;
+        const input = document.getElementById('promptInput');
+        input.value = defaultVal;
+        pendingPromptAction = actionFn;
+        document.getElementById('promptModal').style.display = 'flex';
+        input.focus();
+        input.select();
+    }
+    function closePrompt() {
+        pendingPromptAction = null;
+        document.getElementById('promptModal').style.display = 'none';
+    }
+    document.getElementById('promptCancelBtn').addEventListener('click', closePrompt);
+    document.getElementById('promptOkBtn').addEventListener('click', () => {
+        const val = document.getElementById('promptInput').value;
+        if(pendingPromptAction) pendingPromptAction(val);
+        closePrompt();
     });
     
     document.addEventListener('keydown', e => {
-        const modal = document.getElementById('confirmModal');
-        if (modal && modal.style.display === 'flex') {
+        const confirmModal = document.getElementById('confirmModal');
+        const promptModal = document.getElementById('promptModal');
+        
+        if (confirmModal && confirmModal.style.display === 'flex') {
             if (e.key === 'Enter') {
                 e.preventDefault();
-                if(pendingDeleteId) deleteChatCard(pendingDeleteId);
+                if(pendingConfirmAction) pendingConfirmAction();
                 closeConfirm();
             } else if (e.key === 'Escape') {
                 closeConfirm();
+            }
+        } else if (promptModal && promptModal.style.display === 'flex') {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const val = document.getElementById('promptInput').value;
+                if(pendingPromptAction) pendingPromptAction(val);
+                closePrompt();
+            } else if (e.key === 'Escape') {
+                closePrompt();
             }
         } else if (e.key === 'Escape') {
             closeLightbox();
         }
     });
+
+    function confirmDeleteCard(cid) {
+        showConfirm("确定要删除此记录吗？", "删除后数据将无法恢复", () => deleteChatCard(cid));
+    }
 
     function scrollFeedToBottom() { const f=document.getElementById('chatFeed'); f.scrollTop=f.scrollHeight; }
     function scrollToTop() { document.getElementById('chatFeed').scrollTo({top:0,behavior:'smooth'}); }
@@ -829,28 +902,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
         } catch(e) { console.error('Create session failed', e); }
     }
 
-    async function renameSession(id) {
+    function renameSession(id) {
         const sess = sessionsData.find(s => s.id === id);
         if(!sess) return;
-        const newName = prompt('请输入新的对话名称：', sess.title);
-        if (newName && newName.trim()) {
-            sess.title = newName.trim();
-            renderSessionsList();
-            await fetchApi('/api/ui_sessions', { method: 'POST', body: JSON.stringify({action: 'rename', id, title: sess.title})});
-        }
+        showCustomPrompt('请输入新的对话名称：', sess.title, async (newName) => {
+            if (newName && newName.trim()) {
+                sess.title = newName.trim();
+                renderSessionsList();
+                await fetchApi('/api/ui_sessions', { method: 'POST', body: JSON.stringify({action: 'rename', id, title: sess.title})});
+            }
+        });
     }
 
-    async function deleteSession(id) {
-        if (!confirm('确定要删除这个对话吗？历史记录将无法恢复。')) return;
-        await fetchApi('/api/ui_sessions', { method: 'DELETE', body: JSON.stringify({id})});
-        sessionsData = sessionsData.filter(s => s.id !== id);
-        if (currentSessionId === id) currentSessionId = null;
-        if (sessionsData.length === 0) {
-            await createNewSession();
-        } else {
-            renderSessionsList();
-            if(!currentSessionId) selectSession(sessionsData[0].id);
-        }
+    function deleteSession(id) {
+        showConfirm('确定要删除这个对话吗？', '历史记录将无法恢复', async () => {
+            await fetchApi('/api/ui_sessions', { method: 'DELETE', body: JSON.stringify({id})});
+            sessionsData = sessionsData.filter(s => s.id !== id);
+            if (currentSessionId === id) currentSessionId = null;
+            if (sessionsData.length === 0) {
+                await createNewSession();
+            } else {
+                renderSessionsList();
+                if(!currentSessionId) selectSession(sessionsData[0].id);
+            }
+        });
     }
 
     function selectSession(id) {
@@ -865,7 +940,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const feed = document.getElementById('chatFeed');
         feed.innerHTML = '';
         if (!messages || messages.length === 0) {
-            feed.innerHTML = '<div class="feed-placeholder" id="emptyState">准备就绪，请输入您的创意...</div>';
+            feed.innerHTML = '<div class="feed-placeholder" id="emptyState"></div>';
             return;
         }
         messages.forEach(chat => {
@@ -873,11 +948,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 renderPendingCard(chat);
             } else {
                 let ci='';
-                if(chat.status==='success') {
+                // 如果有URL或错误数组，则构建插槽网格，统一错误/成功的外观
+                if((chat.urls && chat.urls.length > 0) || (chat.errors && chat.errors.length > 0)) {
                     ci=buildResultHTML(chat);
-                } else if(chat.status==='error') {
-                    const errStr = (chat.errors||[]).filter(x=>x).join('; ');
-                    ci='<span class="err-text">'+escHtml(errStr || chat.error || '生成失败')+'</span>';
+                } else {
+                    const errStr = chat.error || '生成失败';
+                    ci='<span class="err-text">'+escHtml(errStr)+'</span>';
                 }
                 feed.insertAdjacentHTML('beforeend', buildCardHTML(chat,ci));
             }
@@ -913,6 +989,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function downloadImage(url,filename) { fetch(url).then(r=>r.blob()).then(blob=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename||'image.jpg'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href); }).catch(()=>window.open(url)); }
     function escHtml(s) { const d=document.createElement('div'); d.innerText=s||''; return d.innerHTML; }
 
+    function getKeyBadgeHTML(keyStr, costNum, remainNum) {
+        if (!keyStr) return '';
+        const shortKey = keyStr.length > 10 ? (keyStr.substring(0,4) + '...' + keyStr.substring(keyStr.length-4)) : keyStr;
+        const costHtml = costNum > 0 ? `<span style="color: #ef4444; margin-left: 6px;">-${costNum}</span>` : '';
+        const remainHtml = `<span style="color: var(--accent); margin-left: 6px;">${remainNum}</span>`;
+        return `<div class="slot-key-badge" title="${escHtml(keyStr)}"><span style="color: #a1a1aa;">${escHtml(shortKey)}</span>${costHtml}${remainHtml}</div>`;
+    }
+
     function buildSlotLoading(sid) {
         const colors=['#10b981','#34d399','#6ee7b7','#a7f3d0','#059669','#047857','#065f46'];
         let particles='';
@@ -925,42 +1009,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
         return '<div class="lp-inner"><div class="lp-particles">'+particles+'</div><div class="lp-ring"></div><div class="lp-center-glow"></div><div class="lp-text" id="timer_'+sid+'">0.0s</div></div>';
     }
 
-    function renderSlotImage(slotId, url, timeTaken) {
+    function renderSlotImage(slotId, url, timeTaken, keyStr, costNum, remainNum) {
         const el = document.getElementById(slotId);
         if (!el) return;
         const su = url.replace(/'/g, "\\'");
+        const sk = (keyStr||'').replace(/'/g, "\\'");
         const fname = url.split('/').pop() || 'image.jpg';
         const timeBadge = timeTaken ? `<div class="slot-time-badge">${timeTaken}s</div>` : '';
-        el.innerHTML = '<img src="'+url+'" onclick="openLightbox(\''+su+'\')">' +
-            timeBadge +
+        const keyBadge = getKeyBadgeHTML(keyStr, costNum, remainNum);
+        
+        el.innerHTML = '<img src="'+url+'" onclick="event.stopPropagation();openLightbox(\''+su+'\', \''+sk+'\', \''+(costNum||0)+'\', \''+(remainNum||0)+'\')">' +
+            timeBadge + keyBadge +
             '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button>';
     }
     
-    function renderSlotError(slotId, msg, timeTaken) {
+    function renderSlotError(slotId, msg, timeTaken, keyStr, costNum, remainNum) {
         const el = document.getElementById(slotId);
         if (!el) return;
         const timeBadge = timeTaken ? `<div class="slot-time-badge">${timeTaken}s</div>` : '';
-        el.innerHTML = timeBadge + '<div class="slot-err">'+escHtml(msg)+'</div>';
+        const keyBadge = getKeyBadgeHTML(keyStr, costNum, remainNum);
+        el.innerHTML = timeBadge + keyBadge + '<div class="slot-err">'+escHtml(msg)+'</div>';
     }
 
     function buildResultHTML(chatObj) {
         const urls = chatObj.urls || [];
         const times = chatObj.times || [];
         const errors = chatObj.errors || [];
+        const keys = chatObj.keys || [];
+        const costs = chatObj.costs || [];
+        const remains = chatObj.remains || [];
         const n = chatObj.payload.n || 1;
         let imgs = '';
+        
         for(let i=0; i<n; i++) {
+            const kBadge = getKeyBadgeHTML(keys[i], costs[i], remains[i]);
+            const tBadge = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+            const sk = (keys[i]||'').replace(/'/g, "\\'");
+            const cNum = costs[i] || 0;
+            const rNum = remains[i] || 0;
+            
             if (urls[i]) {
                 const su = urls[i].replace(/'/g, "\\'");
                 const fname = urls[i].split('/').pop() || ('image_'+i+'.jpg');
-                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
                 imgs += '<div class="img-slot">' +
-                    '<img src="'+urls[i]+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
-                    t +
+                    '<img src="'+urls[i]+'" loading="lazy" onclick="event.stopPropagation();openLightbox(\''+su+'\', \''+sk+'\', \''+cNum+'\', \''+rNum+'\')">' +
+                    tBadge + kBadge +
                     '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
             } else if (errors[i]) {
-                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
-                imgs += '<div class="img-slot">' + t + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
+                imgs += '<div class="img-slot">' + tBadge + kBadge + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
+            } else {
+                imgs += '<div class="img-slot"><div class="slot-err">未知状态</div></div>';
             }
         }
         return '<div class="result-grid">'+imgs+'</div>';
@@ -978,16 +1076,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }).join('') + '</div>';
         }
         const cid = chatObj.id || ('tmp_' + Date.now());
-        
-        let keyInfoHtml = '';
-        if (chatObj.key_info && chatObj.key_info.cost > 0) {
-            keyInfoHtml = `
-            <div class="key-inline-info" id="key_info_${cid}">
-                <span title="使用的 Key">🔑 ${escHtml(chatObj.key_info.key)}</span>
-                <span title="消耗点数" style="color: #ef4444;">📉 ${chatObj.key_info.cost}</span>
-                <span title="剩余点数" style="color: var(--accent);">💎 ${chatObj.key_info.remaining}</span>
-            </div>`;
-        }
 
         const topActionsHtml = `
             <div class="card-top-actions">
@@ -1002,13 +1090,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         return '<div class="chat-card" id="'+cid+'">'+
             topActionsHtml +
             '<div class="card-header"><div class="avatar">✨</div><div class="prompt-box" style="display:flex; flex-direction:column;">'+
-            '<div style="font-size:15px; padding-right: 70px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
+            '<div style="font-size:15px; padding-top: 10px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
             '<div class="param-tags" id="tags_'+cid+'">'+
             '<span class="param-tag">'+escHtml(modelLabel)+'</span>'+
             '<span class="param-tag">'+escHtml(p.size||'')+'</span>'+
             '<span class="param-tag">'+escHtml(p.aspect_ratio||'')+'</span>'+
             '<span class="param-tag">'+(p.n||1)+'张</span>'+
-            keyInfoHtml +
             '</div></div></div>'+
             '<div class="card-content" id="content_'+cid+'">'+contentInner+'</div></div>';
     }
@@ -1018,21 +1105,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const urls = chatObj.urls || [];
         const errors = chatObj.errors || [];
         const times = chatObj.times || [];
+        const keys = chatObj.keys || [];
+        const costs = chatObj.costs || [];
+        const remains = chatObj.remains || [];
         let slotsHtml = '<div class="result-grid" id="grid_'+chatObj.id+'">';
         
         for(let i=0; i<n; i++){
             const sid = chatObj.id + '_s' + i;
+            const tBadge = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
+            const kBadge = getKeyBadgeHTML(keys[i], costs[i], remains[i]);
+            const sk = (keys[i]||'').replace(/'/g, "\\'");
+            const cNum = costs[i] || 0;
+            const rNum = remains[i] || 0;
+            
             if (urls[i]) {
                 const su = urls[i].replace(/'/g, "\\'");
                 const fname = urls[i].split('/').pop() || ('image_'+i+'.jpg');
-                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
                 slotsHtml += '<div class="img-slot" id="'+sid+'">' +
-                    '<img src="'+urls[i]+'" loading="lazy" onclick="openLightbox(\''+su+'\')">' +
-                    t +
+                    '<img src="'+urls[i]+'" loading="lazy" onclick="event.stopPropagation();openLightbox(\''+su+'\', \''+sk+'\', \''+cNum+'\', \''+rNum+'\')">' +
+                    tBadge + kBadge +
                     '<button class="slot-dl-btn" onclick="event.stopPropagation();downloadImage(\''+su+"','"+fname+'\')" title="下载"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeCAYAAAA7MK6iAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAuklEQVR4nO2RsQ3CMBBFT8AwFFAlFWEAGIKwF2IwFLpQoDABVA8FGSmCIM7JmYL4VS7+v+ezRSKDBBgBe+BGd67Arp7lI86xY6OVjoGDK+U9Xm3rZhyBiX3BagGg6LttyxKFJhwEieJXPGYtgOznYumY/0gUM3RxBqRA1chXQAIsQ4oTl5k18o+zu1Aw8QWYt3SmwDmk+E2ukdZYiHH/mj7/W1MQI7E3ohCfAnhLjXhtLC+B1Vdx5O+4A/EyVeP3ljpBAAAAAElFTkSuQmCC" alt="downloads" style="width: 17px;height: 17px;"></button></div>';
             } else if (errors[i]) {
-                const t = times[i] ? `<div class="slot-time-badge">${times[i]}s</div>` : '';
-                slotsHtml += '<div class="img-slot" id="'+sid+'">' + t + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
+                slotsHtml += '<div class="img-slot" id="'+sid+'">' + tBadge + kBadge + '<div class="slot-err">'+escHtml(errors[i])+'</div></div>';
             } else {
                 slotsHtml += '<div class="img-slot" id="'+sid+'">'+buildSlotLoading(sid)+'</div>';
             }
@@ -1097,7 +1191,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
             created_at: Date.now() / 1000,
             urls: new Array(n).fill(null),
             times: new Array(n).fill(null),
-            errors: new Array(n).fill(null)
+            errors: new Array(n).fill(null),
+            keys: new Array(n).fill(null),
+            costs: new Array(n).fill(null),
+            remains: new Array(n).fill(null)
         };
 
         const sess = sessionsData.find(s => s.id === currentSessionId);
@@ -1148,10 +1245,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             const slotEl = document.getElementById(sid);
                             if (slotEl && slotEl.querySelector('.lp-inner')) { 
                                 if (data.urls && data.urls[i]) {
-                                    renderSlotImage(sid, data.urls[i], data.times ? data.times[i] : null);
+                                    renderSlotImage(sid, data.urls[i], data.times ? data.times[i] : null, data.keys ? data.keys[i] : null, data.costs ? data.costs[i] : null, data.remains ? data.remains[i] : null);
                                     anyNew = true;
                                 } else if (data.errors && data.errors[i]) {
-                                    renderSlotError(sid, data.errors[i], data.times ? data.times[i] : null);
+                                    renderSlotError(sid, data.errors[i], data.times ? data.times[i] : null, data.keys ? data.keys[i] : null, data.costs ? data.costs[i] : null, data.remains ? data.remains[i] : null);
                                     anyNew = true;
                                 }
                             }
@@ -1164,11 +1261,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             const oldCard = document.getElementById(data.id);
                             if (oldCard) {
                                 let ci='';
-                                if(data.status === 'success') {
+                                if ((data.urls && data.urls.length > 0) || (data.errors && data.errors.length > 0)) {
                                     ci = buildResultHTML(data);
                                 } else {
-                                    const errStr = (data.errors||[]).filter(x=>x).join('; ');
-                                    ci = '<span class="err-text">'+escHtml(errStr || data.error || '生成失败')+'</span>';
+                                    const errStr = data.error || '生成失败';
+                                    ci = '<span class="err-text">'+escHtml(errStr)+'</span>';
                                 }
                                 oldCard.outerHTML = buildCardHTML(data, ci);
                             }
@@ -1240,11 +1337,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     async function deleteGalleryItem(id) { if(!id)return; await fetchApi('/api/ui_history',{method:'DELETE',body:JSON.stringify({id})}); loadGallery(); }
+    
     async function loadKeys() {
         try { const r=await fetchApi('/api/ui_keys'); const keys=await r.json(); document.getElementById('keyList').innerHTML=keys.map(k=>'<div class="key-item"><span class="key-item-str">'+k.key+'</span><div style="flex-shrink:0;"><strong style="color:var(--accent);">'+k.points+' 点</strong><button style="background:none;border:none;color:#ef4444;cursor:pointer;margin-left:12px;" onclick="deleteKey(\''+k.key+'\')">✕</button></div></div>').join(''); } catch(e) {}
     }
     async function addKey() { const k=document.getElementById('newKey').value.trim(); if(!k)return; await fetchApi('/api/ui_keys',{method:'POST',body:JSON.stringify({key:k})}); document.getElementById('newKey').value=''; loadKeys(); }
-    async function deleteKey(k) { await fetchApi('/api/ui_keys',{method:'DELETE',body:JSON.stringify({key:k})}); loadKeys(); }
+    function deleteKey(k) { 
+        showConfirm('确定要删除这个 Key 吗？', '删除后如果需要使用请重新添加', async () => {
+            await fetchApi('/api/ui_keys',{method:'DELETE',body:JSON.stringify({key:k})}); 
+            loadKeys(); 
+        });
+    }
 </script>
 </body>
 </html>"""
@@ -1393,9 +1496,9 @@ class UIProxyHandler(BaseHTTPRequestHandler):
             res_data, status = call_backend("/v1/images/upload", data, api_key)
             urls = extract_urls_and_parse(res_data)
             
-            # --- 新增：拦截特定的错误 URL ---
-            if urls and TARGET_ERROR_URL in urls:
-                return self._send(400, {"error": "云端API KEY过期或点数不足"})
+            # --- 拦截特定的错误 URL ---
+            if urls and any(target in urls for target in TARGET_ERROR_URL):
+                return self._send(400, {"error": "云端API KEY 过期、无效或点数不足"})
                 
             res_data["extracted_urls"] = urls
             res_data["url"] = urls[0] if urls else None
@@ -1405,10 +1508,9 @@ class UIProxyHandler(BaseHTTPRequestHandler):
         else: self._send(404, {"error": "Not found"})
 
 if __name__ == '__main__':
-    migrate_old_chats()
     cleanup_ghost_tasks()
     server = ThreadingHTTPServer(('0.0.0.0', UI_PORT), UIProxyHandler)
-    print(f"🚀 [AI Image Studio] 代理服务已启动！")
+    print(f"🚀 [Image Studio WebUI] 代理服务已启动！")
     print(f"👉 访问地址: http://127.0.0.1:{UI_PORT}")
     print(f"📦 模型配置: {list(MODEL_COSTS.keys())}")
     try: server.serve_forever()
