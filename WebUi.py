@@ -13,51 +13,63 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UI_PORT = 8888
 BACKEND_API_BASE = "http://127.0.0.1:22333"
 
-KEYS_FILE = "keys.json"
-HISTORY_FILE = "history.json"
-SESSIONS_FILE = "sessions.json"
+KEYS_FILE = os.path.join(".", "data", "keys.json")
+HISTORY_FILE = os.path.join(".", "data", "history.json")
+SESSIONS_FILE = os.path.join(".", "data", "sessions.json")
 
 # 使用可重入锁 RLock，彻底解决多层函数调用导致的死锁问题
 FILE_LOCK = threading.RLock()
 
 MODEL_COSTS = {
     "gemini-3.1-flash-image": {"512px": 4, "1k": 6, "2k": 10, "4k": 13},
-    "gemini-3-pro-image": {"1k": 10, "2k": 10, "4k": 18}
+    "gemini-3-pro-image": {"1k": 10, "2k": 10, "4k": 18},
 }
 
 MODEL_DISPLAY_NAMES = {
     "gemini-3.1-flash-image": "🍌Nano Banana 2",
-    "gemini-3-pro-image": "🍌Nano Banana Pro"
+    "gemini-3-pro-image": "🍌Nano Banana Pro",
 }
 
 SEVEN_DAYS_SEC = 7 * 24 * 3600
+# favicon / avatar 共用的 base64 图标
+FAVICON_B64 = "data:image/png;base64,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"
+
 # 需要拦截的伪装成成功的无效链接
-TARGET_ERROR_URL = ["https://api.imastudio.com/open/v1/tasks/create","https://api.imastudio.com/open/v1/product/list?app=ima&platform=web&category=image_to_image"]
+TARGET_ERROR_URL = [
+    "https://api.imastudio.com/open/v1/tasks/create",
+    "https://api.imastudio.com/open/v1/product/list?app=ima&platform=web&category=image_to_image",
+]
+
 
 # ================= 核心工具 =================
 def load_json(filename, default_val):
-    if not os.path.exists(filename): return default_val
+    if not os.path.exists(filename):
+        return default_val
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
+        with open(filename, "r", encoding="utf-8") as f:
             content = f.read().strip()
-            if not content: return default_val
+            if not content:
+                return default_val
             return json.loads(content)
     except Exception as e:
         print(f"[Warn] 无法加载文件 {filename}, 将使用默认值。错误: {e}")
         return default_val
 
+
 def save_json(filename, data):
     # 原子化安全写入，先转文本再写入，防止异常打断导致文件被清空变成0字节
     try:
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(json_str)
     except Exception as e:
         print(f"[Error] 保存文件 {filename} 失败: {e}")
 
+
 def calculate_cost(model, size, n):
     cost_map = MODEL_COSTS.get(model, {})
     return cost_map.get(size, 10) * int(n)
+
 
 def get_available_key(cost):
     """获取可用Key并在内存中预扣费"""
@@ -77,9 +89,11 @@ def get_available_key(cost):
                 return k_obj["key"], k_obj["points"]
         return None, 0
 
+
 def refund_key(api_key, cost):
     """如果生成失败，将预扣的点数退还"""
-    if cost <= 0 or not api_key: return
+    if cost <= 0 or not api_key:
+        return
     with FILE_LOCK:
         keys = load_json(KEYS_FILE, [])
         for k_obj in keys:
@@ -87,6 +101,7 @@ def refund_key(api_key, cost):
                 k_obj["points"] += cost
                 save_json(KEYS_FILE, keys)
                 break
+
 
 def clean_and_load_history():
     with FILE_LOCK:
@@ -97,17 +112,19 @@ def clean_and_load_history():
             save_json(HISTORY_FILE, valid)
         return valid
 
+
 def save_history(records):
     with FILE_LOCK:
         now = time.time()
         for rec in records:
             rec["created_at"] = now
             if "id" not in rec:
-                rec["id"] = f"h_{int(now*1000)}_{hash(rec.get('url',''))%100000}"
+                rec["id"] = f"h_{int(now * 1000)}_{hash(rec.get('url', '')) % 100000}"
         history = load_json(HISTORY_FILE, [])
         for rec in reversed(records):
             history.insert(0, rec)
         save_json(HISTORY_FILE, history)
+
 
 def delete_history_item(item_id):
     with FILE_LOCK:
@@ -120,18 +137,26 @@ def load_sessions():
     with FILE_LOCK:
         return load_json(SESSIONS_FILE, [])
 
+
 def save_sessions(sessions):
     with FILE_LOCK:
         save_json(SESSIONS_FILE, sessions)
+
 
 def create_session():
     sessions = load_sessions()
     now = time.time()
     title = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
-    new_sess = {"id": f"sess_{int(now*1000)}", "title": title, "created_at": now, "messages": []}
+    new_sess = {
+        "id": f"sess_{int(now * 1000)}",
+        "title": title,
+        "created_at": now,
+        "messages": [],
+    }
     sessions.insert(0, new_sess)
     save_sessions(sessions)
     return new_sess
+
 
 def cleanup_ghost_tasks():
     """每次启动时清理因为 CLI 服务强行中断而遗留的 'generating' 幽灵卡片"""
@@ -143,26 +168,36 @@ def cleanup_ghost_tasks():
                 if msg.get("status") == "generating":
                     msg["status"] = "error"
                     msg["error"] = "CLI 服务中断"
-                    
+
                     n = msg.get("payload", {}).get("n", 1)
-                    if not msg.get("urls"): msg["urls"] = [None] * n
-                    if not msg.get("times"): msg["times"] = [None] * n
-                    if not msg.get("keys"): msg["keys"] = [None] * n
-                    if not msg.get("costs"): msg["costs"] = [None] * n
-                    if not msg.get("remains"): msg["remains"] = [None] * n
+                    if not msg.get("urls"):
+                        msg["urls"] = [None] * n
+                    if not msg.get("times"):
+                        msg["times"] = [None] * n
+                    if not msg.get("keys"):
+                        msg["keys"] = [None] * n
+                    if not msg.get("costs"):
+                        msg["costs"] = [None] * n
+                    if not msg.get("remains"):
+                        msg["remains"] = [None] * n
                     msg["errors"] = ["CLI 服务中断"] * n
-                    
+
                     ghost_count += 1
-        
+
         if ghost_count > 0:
             save_sessions(sessions)
-            print(f"🔧 [System] 发现并清理了 {ghost_count} 个由于服务异常中断遗留的幽灵任务。")
+            print(
+                f"🔧 [System] 发现并清理了 {ghost_count} 个由于服务异常中断遗留的幽灵任务。"
+            )
+
 
 def extract_urls_and_parse(data):
     urls = []
     if isinstance(data, dict) and "result" in data:
         result_str = str(data["result"])
-        json_blocks = re.findall(r'\{[^{}]*"url"\s*:\s*"https?://[^"]+?"[^{}]*\}', result_str)
+        json_blocks = re.findall(
+            r'\{[^{}]*"url"\s*:\s*"https?://[^"]+?"[^{}]*\}', result_str
+        )
         for jb in json_blocks:
             try:
                 parsed = json.loads(jb)
@@ -171,7 +206,9 @@ def extract_urls_and_parse(data):
             except:
                 pass
         if not urls:
-            found = re.findall(r'(https?://[^\s"\'\\}<>]+\.(?:jpeg|jpg|png|webp|gif))', result_str)
+            found = re.findall(
+                r'(https?://[^\s"\'\\}<>]+\.(?:jpeg|jpg|png|webp|gif))', result_str
+            )
             urls.extend(found)
     if not urls and isinstance(data, dict):
         if "data" in data and isinstance(data["data"], list):
@@ -186,22 +223,27 @@ def extract_urls_and_parse(data):
                 urls.append(u)
     return list(dict.fromkeys(urls))
 
+
 def call_backend(endpoint, payload, api_key):
     url = f"{BACKEND_API_BASE}{endpoint}"
     payload["api_key"] = api_key
-    body_bytes = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=body_bytes, headers={"Content-Type": "application/json"})
+    body_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body_bytes, headers={"Content-Type": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=600) as response:
-            body = response.read().decode('utf-8')
+            body = response.read().decode("utf-8")
             try:
                 parsed = json.loads(body)
             except:
                 parsed = {"result": body}
-            print(f"[Backend {response.status}] {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}")
+            print(
+                f"[Backend {response.status}] {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}"
+            )
             return parsed, response.status
     except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8')
+        body = e.read().decode("utf-8")
         try:
             parsed = json.loads(body)
         except:
@@ -214,51 +256,88 @@ def call_backend(endpoint, payload, api_key):
     except Exception as e:
         return {"error": str(e)}, 500
 
+
 # ================= 后台并发增量生成任务 =================
 def single_generation(payload, cost_per_image, index):
     start_t = time.time()
     # 预扣费
     api_key, remaining = get_available_key(cost_per_image)
     if not api_key:
-        return {"error": "点数不足，无可用Key", "time": 0, "cost": 0, "key": "", "remain": 0, "index": index}
-        
+        return {
+            "error": "点数不足，无可用Key",
+            "time": 0,
+            "cost": 0,
+            "key": "",
+            "remain": 0,
+            "index": index,
+        }
+
     payload_single = dict(payload)
     payload_single["n"] = 1
-    endpoint = "/v1/images/generations" if payload_single.get("type", "text_to_image") == "text_to_image" else "/v1/images/edits"
-    
+    endpoint = (
+        "/v1/images/generations"
+        if payload_single.get("type", "text_to_image") == "text_to_image"
+        else "/v1/images/edits"
+    )
+
     res_data, status = call_backend(endpoint, payload_single, api_key)
     time_taken = round(time.time() - start_t, 1)
-    
+
     if "extracted_urls" not in res_data:
         urls = extract_urls_and_parse(res_data)
     else:
         urls = res_data["extracted_urls"]
-        
+
     # --- 拦截点数耗尽的假链接 ---
     if urls and any(target in urls for target in TARGET_ERROR_URL):
-        refund_key(api_key, cost_per_image) # 退还预扣的点数
-        return {"error": "云端API KEY 过期、无效或点数不足", "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
+        refund_key(api_key, cost_per_image)  # 退还预扣的点数
+        return {
+            "error": "云端API KEY 过期、无效或点数不足",
+            "time": time_taken,
+            "cost": 0,
+            "key": api_key,
+            "remain": remaining + cost_per_image,
+            "index": index,
+        }
 
     if urls:
-        return {"url": urls[0], "time": time_taken, "cost": cost_per_image, "key": api_key, "remain": remaining, "index": index}
+        return {
+            "url": urls[0],
+            "time": time_taken,
+            "cost": cost_per_image,
+            "key": api_key,
+            "remain": remaining,
+            "index": index,
+        }
     else:
         err_msg = res_data.get("error", "获取图片失败")
         if isinstance(err_msg, dict):
             err_msg = json.dumps(err_msg, ensure_ascii=False)
-        refund_key(api_key, cost_per_image) # 发生其他错误也退还点数
-        return {"error": str(err_msg), "time": time_taken, "cost": 0, "key": api_key, "remain": remaining + cost_per_image, "index": index}
+        refund_key(api_key, cost_per_image)  # 发生其他错误也退还点数
+        return {
+            "error": str(err_msg),
+            "time": time_taken,
+            "cost": 0,
+            "key": api_key,
+            "remain": remaining + cost_per_image,
+            "index": index,
+        }
+
 
 def background_generation(session_id, chat_id, payload, n):
     cost_per_image = calculate_cost(payload.get("model_id"), payload.get("size"), 1)
     completed_count = 0
-    
+
     # 多线程并发，独立插槽更新
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
-        futures = [executor.submit(single_generation, payload, cost_per_image, i) for i in range(n)]
+        futures = [
+            executor.submit(single_generation, payload, cost_per_image, i)
+            for i in range(n)
+        ]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             idx = res["index"]
-            
+
             with FILE_LOCK:
                 sessions = load_sessions()
                 for s in sessions:
@@ -266,43 +345,56 @@ def background_generation(session_id, chat_id, payload, n):
                         for msg in s["messages"]:
                             if msg["id"] == chat_id:
                                 # 确保各个数组已就绪
-                                if not msg.get("urls"): msg["urls"] = [None] * n
-                                if not msg.get("times"): msg["times"] = [None] * n
-                                if not msg.get("errors"): msg["errors"] = [None] * n
-                                if not msg.get("keys"): msg["keys"] = [None] * n
-                                if not msg.get("costs"): msg["costs"] = [None] * n
-                                if not msg.get("remains"): msg["remains"] = [None] * n
-                                
+                                if not msg.get("urls"):
+                                    msg["urls"] = [None] * n
+                                if not msg.get("times"):
+                                    msg["times"] = [None] * n
+                                if not msg.get("errors"):
+                                    msg["errors"] = [None] * n
+                                if not msg.get("keys"):
+                                    msg["keys"] = [None] * n
+                                if not msg.get("costs"):
+                                    msg["costs"] = [None] * n
+                                if not msg.get("remains"):
+                                    msg["remains"] = [None] * n
+
                                 msg["times"][idx] = res["time"]
                                 msg["keys"][idx] = res.get("key", "")
                                 msg["costs"][idx] = res.get("cost", 0)
                                 msg["remains"][idx] = res.get("remain", 0)
-                                
+
                                 if "url" in res:
                                     msg["urls"][idx] = res["url"]
                                 else:
                                     msg["errors"][idx] = res["error"]
-                                    
+
                                 completed_count += 1
                                 if completed_count == n:
                                     # 全局完成，检查状态
-                                    has_success = any(u for u in msg["urls"] if u is not None)
-                                    msg["status"] = "success" if has_success else "error"
+                                    has_success = any(
+                                        u for u in msg["urls"] if u is not None
+                                    )
+                                    msg["status"] = (
+                                        "success" if has_success else "error"
+                                    )
                                 break
                         break
                 save_sessions(sessions)
-                
+
             if "url" in res:
-                save_history([{"type": payload.get("type", "text_to_image"), "url": res["url"]}])
+                save_history(
+                    [{"type": payload.get("type", "text_to_image"), "url": res["url"]}]
+                )
 
 
 # ================= HTML =================
-HTML_PAGE = r"""<!DOCTYPE html>
+HTML_PAGE_RAW = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Image Chat Studio</title>
+    <link rel="icon" type="image/png" href="__FAVICON_PLACEHOLDER__">
+    <title>Image Studio WebUI</title>
     <style>
         :root {
             --bg: #09090b; --surface: #18181b; --surface-hover: #27272a;
@@ -381,7 +473,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 
         .card-header { display: flex; gap: 12px; align-items: flex-start; }
-        .avatar { width: 36px; height: 36px; background: var(--surface); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; border: 1px solid var(--border); flex-shrink: 0; }
+        .avatar { width: 36px; height: 36px; background: var(--surface); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 16px; border: 1px solid var(--border); flex-shrink: 0; overflow: hidden; }
         .prompt-box { background: var(--surface); padding: 14px 18px; border-radius: 0 16px 16px 16px; font-size: 14px; line-height: 1.6; border: 1px solid var(--border); width: 100%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column;}
         .card-attachments { display: flex; gap: 8px; margin-top: 10px; overflow-x: auto; padding-bottom: 5px; }
         .card-attachments img { height: 48px; width: 48px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: pointer; }
@@ -1089,7 +1181,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         return '<div class="chat-card" id="'+cid+'">'+
             topActionsHtml +
-            '<div class="card-header"><div class="avatar">✨</div><div class="prompt-box" style="display:flex; flex-direction:column;">'+
+            '<div class="card-header"><div class="avatar"><img style="width: 100%;height: 100%" src="__FAVICON_PLACEHOLDER__"/></div><div class="prompt-box" style="display:flex; flex-direction:column;">'+
             '<div style="font-size:15px; padding-top: 10px;">'+escHtml(p.prompt||'[以图生图模式]')+'</div>'+attHtml+
             '<div class="param-tags" id="tags_'+cid+'">'+
             '<span class="param-tag">'+escHtml(modelLabel)+'</span>'+
@@ -1352,38 +1444,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </body>
 </html>"""
 
+
+HTML_PAGE = HTML_PAGE_RAW.replace("__FAVICON_PLACEHOLDER__", FAVICON_B64)
+
 # ================= HTTP 服务 =================
 class UIProxyHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
+    def log_message(self, format, *args):
+        pass
 
-    def _send(self, status, payload=None, ctype='application/json'):
+    def _send(self, status, payload=None, ctype="application/json"):
         self.send_response(status)
-        self.send_header('Content-type', ctype)
+        self.send_header("Content-type", ctype)
         # 强制击穿浏览器缓存机制
-        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
-        self.send_header('Pragma', 'no-cache')
-        self.send_header('Expires', '0')
+        self.send_header(
+            "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"
+        )
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
-        
+
         if payload is not None:
-            if 'json' in ctype:
-                self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+            if "json" in ctype:
+                self.wfile.write(
+                    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                )
             else:
-                self.wfile.write(payload.encode('utf-8'))
+                self.wfile.write(payload.encode("utf-8"))
 
     def _body(self):
-        length = int(self.headers.get('Content-Length', 0))
-        if length == 0: return {}
-        try: return json.loads(self.rfile.read(length).decode('utf-8'))
-        except: return None
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except:
+            return None
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == "/": self._send(200, HTML_PAGE, 'text/html; charset=utf-8')
-        elif path == "/api/ui_keys": self._send(200, load_json(KEYS_FILE, []))
-        elif path == "/api/ui_history": self._send(200, clean_and_load_history())
-        elif path == "/api/ui_sessions": self._send(200, load_sessions())
-        elif path == "/api/ui_config": self._send(200, {"model_costs": MODEL_COSTS, "model_names": MODEL_DISPLAY_NAMES})
+        if path == "/":
+            self._send(200, HTML_PAGE, "text/html; charset=utf-8")
+        elif path == "/api/ui_keys":
+            self._send(200, load_json(KEYS_FILE, []))
+        elif path == "/api/ui_history":
+            self._send(200, clean_and_load_history())
+        elif path == "/api/ui_sessions":
+            self._send(200, load_sessions())
+        elif path == "/api/ui_config":
+            self._send(
+                200, {"model_costs": MODEL_COSTS, "model_names": MODEL_DISPLAY_NAMES}
+            )
         elif path == "/api/ui_chat_status":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sess_id = query.get("session_id", [None])[0]
@@ -1396,7 +1506,8 @@ class UIProxyHandler(BaseHTTPRequestHandler):
                             if m["id"] == chat_id:
                                 return self._send(200, m)
             return self._send(404, {"error": "Not found"})
-        else: self._send(404, {"error": "Not found"})
+        else:
+            self._send(404, {"error": "Not found"})
 
     def do_DELETE(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1409,7 +1520,8 @@ class UIProxyHandler(BaseHTTPRequestHandler):
                     save_json(KEYS_FILE, keys)
             self._send(200, {"status": "ok"})
         elif path == "/api/ui_history":
-            if data and data.get("id"): delete_history_item(data["id"])
+            if data and data.get("id"):
+                delete_history_item(data["id"])
             self._send(200, {"status": "ok"})
         elif path == "/api/ui_sessions":
             if data and data.get("id"):
@@ -1424,16 +1536,20 @@ class UIProxyHandler(BaseHTTPRequestHandler):
                 sessions = load_sessions()
                 for s in sessions:
                     if s["id"] == sess_id:
-                        s["messages"] = [m for m in s["messages"] if m.get("id") != chat_id]
+                        s["messages"] = [
+                            m for m in s["messages"] if m.get("id") != chat_id
+                        ]
                         break
                 save_sessions(sessions)
             self._send(200, {"status": "ok"})
-        else: self._send(404, {"error": "Not found"})
+        else:
+            self._send(404, {"error": "Not found"})
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         data = self._body()
-        if data is None: return self._send(400, {"error": "Invalid JSON"})
+        if data is None:
+            return self._send(400, {"error": "Invalid JSON"})
 
         if path == "/api/ui_keys":
             new_key = data.get("key")
@@ -1469,7 +1585,14 @@ class UIProxyHandler(BaseHTTPRequestHandler):
                     sessions = load_sessions()
                     for s in sessions:
                         if s["id"] == sess_id:
-                            idx = next((i for i, m in enumerate(s["messages"]) if m["id"] == msg["id"]), -1)
+                            idx = next(
+                                (
+                                    i
+                                    for i, m in enumerate(s["messages"])
+                                    if m["id"] == msg["id"]
+                                ),
+                                -1,
+                            )
                             if idx != -1:
                                 s["messages"][idx] = msg
                             else:
@@ -1484,34 +1607,44 @@ class UIProxyHandler(BaseHTTPRequestHandler):
             payload = data.get("payload", {})
             n = int(payload.get("n", 1))
 
-            t = threading.Thread(target=background_generation, args=(sess_id, chat_id, payload, n))
+            t = threading.Thread(
+                target=background_generation, args=(sess_id, chat_id, payload, n)
+            )
             t.daemon = True
             t.start()
-            
+
             return self._send(200, {"status": "started"})
 
         elif path == "/api/ui_upload":
             api_key, _ = get_available_key(0)
-            if not api_key: return self._send(400, {"error": "缺少 API Key 配置"})
+            if not api_key:
+                return self._send(400, {"error": "缺少 API Key 配置"})
             res_data, status = call_backend("/v1/images/upload", data, api_key)
             urls = extract_urls_and_parse(res_data)
-            
+
             # --- 拦截特定的错误 URL ---
             if urls and any(target in urls for target in TARGET_ERROR_URL):
                 return self._send(400, {"error": "云端API KEY 过期、无效或点数不足"})
-                
+
             res_data["extracted_urls"] = urls
             res_data["url"] = urls[0] if urls else None
-            if urls: save_history([{"type": "upload", "url": urls[0]}])
+            if urls:
+                save_history([{"type": "upload", "url": urls[0]}])
             return self._send(status, res_data)
 
-        else: self._send(404, {"error": "Not found"})
+        else:
+            self._send(404, {"error": "Not found"})
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    os.makedirs("data", exist_ok=True)
     cleanup_ghost_tasks()
-    server = ThreadingHTTPServer(('0.0.0.0', UI_PORT), UIProxyHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", UI_PORT), UIProxyHandler)
     print(f"🚀 [Image Studio WebUI] 代理服务已启动！")
     print(f"👉 访问地址: http://127.0.0.1:{UI_PORT}")
     print(f"📦 模型配置: {list(MODEL_COSTS.keys())}")
-    try: server.serve_forever()
-    except KeyboardInterrupt: print("\n服务关闭。"); server.server_close()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n服务关闭。")
+        server.server_close()
