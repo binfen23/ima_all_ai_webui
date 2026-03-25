@@ -1,75 +1,33 @@
 #!/usr/bin/env python3
 """
-IMA AI Creation Script — ima_create.py
-Version: 1.2.2
+IMA Image Creation Script — ima_image_create.py
+Version: 1.0.8
 
-Reliable task creation via IMA Open API.
-Handles: product list query → virtual param resolution → task create → poll status
+Image generation via IMA Open API.
+Flow: product list → virtual param resolution → task create → poll status.
 
-🆕 v1.2.2 Features (TTS integration):
-  - Added text_to_speech task type (poll 3s, max_wait 120s); model_id from product list. See ima-tts-ai skill.
-
-🆕 v1.2.1 Features (music-specific enhancements aligned with ima-voice-ai):
-  - Added comprehensive Suno prompt writing guide (Genre, Tempo, Vocals, Mood, Negative tags)
-  - Added music-specific error translations (Lyrics format, Prompt length)
-  - Enhanced music use case guide: 4 detailed scenarios vs 2 basic
-  - Added dedicated music failure fallback strategies (Suno ↔ DouBao BGM ↔ DouBao Song)
-  - Added technical notes for Suno model_version handling
-  - Documented all Suno parameters: custom_mode, make_instrumental, auto_lyrics, tags, negative_tags
-
-🆕 v1.2.0 Features (aligned with ima-image-ai v1.3):
-  - Added Step 0 initial acknowledgment reply (fixes message ordering in group chats)
-  - Enhanced UX protocol to 6-step flow (0: Ack → 1: Pre-Gen → 2: Progress → 3: Success → 4: Failure → 5: Done)
-  - Added Midjourney timing estimates (40~90s, poll 8s, progress 25s)
-  - Enhanced recommended model table with version_id and budget/premium/artistic classifications
-  - Added detailed "Selection guide by use case" with 6+ scenarios
-  - Enhanced aspect_ratio documentation with 🆕 MAJOR UPDATE callout and user guidance templates
-  - Added Step 5 explicit task completion step
-
-🆕 v1.1.0 Features:
-  - Added user preference memory system (~/.openclaw/memory/ima_prefs.json)
-  - Enhanced UX protocol with 4-step generation flow
-  - Detailed progress updates with time estimates
-  - Video-specific handling: inline player + text link
-  - Preference-aware model selection with user habit tracking
-
-🆕 v1.0.9 Features:
-  - Updated documentation to reflect aspect_ratio support for image models
-  - Added Midjourney to production image models list
-  - Clarified aspect_ratio support: SeeDream 4.5 (8 ratios), Nano Banana Pro/2 (5 ratios)
-
-🆕 v1.0.8 Features:
-  - Enhanced error handling for 401 (Unauthorized) and 4008 (Insufficient points)
-  - Clickable links to API key generation and credit purchase pages
-  - Pixverse model parameter auto-inference for V5.5/V5/V4
-
-🆕 v1.0.5 Features:
-  - Automatic error recovery (Reflection mechanism)
-  - Smart parameter matching with case-insensitive support
-  - 500 error handling with parameter degradation
-  - 6009/6010 error auto-correction
-  - Up to 3 automatic retries with detailed failure suggestions
+- Task types: text_to_image | image_to_image
+- --input-images: accepts HTTPS URLs or local file paths (local files auto-uploaded to IMA CDN).
 
 Usage:
-  python3 ima_create.py \
-    --api-key  ima_xxx \
-    --task-type text_to_image \
-    --model-id  doubao-seedream-4.5 \
-    --prompt   "a cute puppy running on grass"
-
-Supports all task types:
-  text_to_image | image_to_image | text_to_video | image_to_video |
-  first_last_frame_to_video | reference_image_to_video | text_to_music | text_to_speech
+  python3 ima_image_create.py --api-key ima_xxx --task-type text_to_image \\
+    --model-id doubao-seedream-4.5 --prompt "a cute puppy"
 
 Logs: ~/.openclaw/logs/ima_skills/ima_create_YYYYMMDD.log
 """
 
 import argparse
+import hashlib
 import json
+import math
+import mimetypes
 import os
+import re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 try:
     import requests
@@ -94,20 +52,34 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
+# Primary API endpoint (owned by IMA Studio)
 DEFAULT_BASE_URL = "https://api.imastudio.com"
-PREFS_PATH       = os.path.expanduser("~/.openclaw/memory/ima_prefs.json")
+
+# Image upload endpoint (owned by IMA Studio)
+# Used for: image_to_image tasks
+# Purpose: Upload images to OSS to obtain CDN URLs for image generation
+# See SECURITY.md for full domain disclosure and privacy implications
+DEFAULT_IM_BASE_URL = "https://imapi.liveme.com"
+
+PREFS_PATH = os.path.expanduser("~/.openclaw/memory/ima_prefs.json")
 
 # Poll interval (seconds) and max wait (seconds) per task type
+# Image generation only
 POLL_CONFIG = {
-    "text_to_image":             {"interval": 5,  "max_wait": 300},
-    "image_to_image":            {"interval": 5,  "max_wait": 300},
-    "text_to_video":             {"interval": 8,  "max_wait": 600},
-    "image_to_video":            {"interval": 8,  "max_wait": 600},
-    "first_last_frame_to_video": {"interval": 8,  "max_wait": 600},
-    "reference_image_to_video":  {"interval": 8,  "max_wait": 600},
-    "text_to_music":             {"interval": 5,  "max_wait": 300},
-    "text_to_speech":            {"interval": 3,  "max_wait": 120},
+    "text_to_image":  {"interval": 5, "max_wait": 600},
+    "image_to_image": {"interval": 5, "max_wait": 600},
 }
+
+# App Key configuration (for OSS upload authentication)
+# These are shared keys used by all IMA skill-based uploads
+# NOT a secret - visible in public source code
+# Used to generate request signatures for imapi.liveme.com upload API
+# See SECURITY.md § "Credentials" for security implications
+APP_ID = "webAgent"
+APP_KEY = "32jdskjdk320eew"
+
+# Note: APP_UID and APP_TOKEN should be configured via environment variables
+# They can be obtained from: POST /api/v3/login/app → data.user_id & data.token
 
 
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -119,6 +91,179 @@ def make_headers(api_key: str, language: str = "en") -> dict:
         "x-app-source":   "ima_skills",
         "x_app_language": language,
     }
+
+
+# ─── Image Upload (OSS) ───────────────────────────────────────────────────────
+
+def _gen_sign() -> tuple[str, str, str]:
+    """
+    Generate per-request (sign, timestamp, nonce) for IM authentication.
+    
+    Returns:
+        (sign, timestamp, nonce)
+    """
+    nonce = uuid.uuid4().hex[:21]
+    ts = str(int(time.time()))
+    raw = f"{APP_ID}|{APP_KEY}|{ts}|{nonce}"
+    sign = hashlib.sha1(raw.encode()).hexdigest().upper()
+    return sign, ts, nonce
+
+
+def get_upload_token(api_key: str, suffix: str, 
+                     content_type: str, im_base_url: str = DEFAULT_IM_BASE_URL) -> dict:
+    """
+    Step 1: Get presigned upload URL from IM platform (imapi.liveme.com).
+    
+    **Security Note**: This function sends your IMA API key to imapi.liveme.com,
+    which is IMA Studio's dedicated image upload service (separate from the main API).
+    
+    Why the API key is sent here:
+    - imapi.liveme.com is owned and operated by IMA Studio
+    - The upload service authenticates requests using the same IMA API key
+    - This allows secure, authenticated image uploads without separate credentials
+    - Images are stored in IMA's OSS infrastructure and returned as CDN URLs
+    
+    The two-domain architecture separates concerns:
+    - api.imastudio.com: Image generation API (task orchestration)
+    - imapi.liveme.com: Media storage API (large file uploads)
+    
+    See SECURITY.md § "Network Endpoints Used" for full disclosure.
+    
+    Calls GET /api/rest/oss/getuploadtoken with exactly 11 params.
+    
+    Args:
+        api_key: IMA API key (used as both appUid and cmimToken for authentication)
+        suffix: File extension (jpeg, png, mp4, etc.)
+        content_type: MIME type (image/jpeg, video/mp4, etc.)
+        im_base_url: IM upload service URL (default: https://imapi.liveme.com)
+    
+    Returns:
+        dict with keys:
+        - "ful": Presigned PUT URL for uploading raw bytes
+        - "fdl": CDN download URL for the uploaded file
+    
+    Raises:
+        RuntimeError: If upload token request fails
+    """
+    sign, ts, nonce = _gen_sign()
+    
+    url = f"{im_base_url}/api/rest/oss/getuploadtoken"
+    params = {
+        # Use IMA API key for both appUid and cmimToken
+        "appUid": api_key,
+        "appId": APP_ID,
+        "appKey": APP_KEY,
+        "cmimToken": api_key,
+        "sign": sign,
+        "timestamp": ts,
+        "nonce": nonce,
+        # File params
+        "fService": "privite",
+        "fType": "picture",  # picture / video / audio
+        "fSuffix": suffix,
+        "fContentType": content_type,
+    }
+    
+    logger.info(f"Getting upload token: suffix={suffix}, content_type={content_type}")
+    
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if data.get("code") not in (0, 200):
+            raise RuntimeError(f"Get upload token failed: {data.get('message')}")
+        
+        token_data = data.get("data", {})
+        logger.info(f"Upload token obtained: fdl={token_data.get('fdl', '')[:50]}...")
+        return token_data
+    
+    except requests.RequestException as e:
+        logger.error(f"Failed to get upload token: {e}")
+        raise RuntimeError(f"Failed to get upload token: {e}")
+
+
+def upload_to_oss(image_bytes: bytes, content_type: str, ful: str) -> None:
+    """
+    Step 2: PUT image bytes to the presigned OSS URL.
+    
+    Args:
+        image_bytes: Raw image bytes
+        content_type: MIME type (e.g., image/jpeg)
+        ful: Presigned PUT URL from get_upload_token
+    """
+    logger.info(f"Uploading {len(image_bytes)} bytes to OSS...")
+    
+    try:
+        resp = requests.put(ful, data=image_bytes, 
+                           headers={"Content-Type": content_type}, 
+                           timeout=60)
+        resp.raise_for_status()
+        logger.info("Upload to OSS successful")
+    
+    except requests.RequestException as e:
+        logger.error(f"Failed to upload to OSS: {e}")
+        raise RuntimeError(f"Failed to upload to OSS: {e}")
+
+
+def prepare_image_url(source: str | bytes, api_key: str,
+                      im_base_url: str = DEFAULT_IM_BASE_URL) -> str:
+    """
+    Full workflow: convert any image source to a public HTTPS CDN URL.
+    
+    - If source is already a public HTTPS URL → return as-is
+    - If source is a local file path or bytes → upload to OSS first
+    
+    Args:
+        source: File path (str), raw bytes, or already-public HTTPS URL
+        api_key: IMA API key (used directly for upload authentication)
+        im_base_url: IM platform base URL
+    
+    Returns:
+        Public HTTPS CDN URL ready to use as input_images value
+    """
+    # Already a public URL → use directly, no upload needed
+    if isinstance(source, str) and source.startswith("https://"):
+        logger.info(f"Image is already a public URL: {source[:50]}...")
+        return source
+    
+    # Need to upload
+    if not api_key:
+        raise RuntimeError("Local image upload requires IMA API key (--api-key)")
+    
+    # Read file bytes
+    if isinstance(source, str):
+        # Local file path
+        if not os.path.isfile(source):
+            raise RuntimeError(f"Image file not found: {source}")
+        
+        ext = Path(source).suffix.lstrip(".").lower() or "jpeg"
+        with open(source, "rb") as f:
+            image_bytes = f.read()
+        content_type = mimetypes.guess_type(source)[0] or "image/jpeg"
+        logger.info(f"Read local file: {source} ({len(image_bytes)} bytes)")
+    
+    else:
+        # Raw bytes
+        image_bytes = source
+        ext = "jpeg"
+        content_type = "image/jpeg"
+        logger.info(f"Using raw image bytes ({len(image_bytes)} bytes)")
+    
+    # Step 1: Get presigned URL using API key
+    token_data = get_upload_token(api_key, ext, content_type, im_base_url)
+    ful = token_data.get("ful")
+    fdl = token_data.get("fdl")
+    
+    if not ful or not fdl:
+        raise RuntimeError("Upload token missing 'ful' or 'fdl' field")
+    
+    # Step 2: Upload to OSS
+    upload_to_oss(image_bytes, content_type, ful)
+    
+    # Step 3: Return CDN URL
+    logger.info(f"Image uploaded successfully: {fdl[:50]}...")
+    return fdl
 
 
 # ─── Step 1: Product List ─────────────────────────────────────────────────────
@@ -394,9 +539,9 @@ def select_credit_rule_by_params(credit_rules: list, user_params: dict) -> dict 
     def normalize_value(v):
         if isinstance(v, bool):
             return str(v).lower()  # False → "false", True → "true"
-        # CRITICAL FIX: Case-insensitive matching for size/resolution/duration values
-        # User may pass "1k" but rules define "1K", or "1080p" vs "1080P"
-        return str(v).strip().upper()  # "1k" → "1K", "1080p" → "1080P"
+        # CRITICAL FIX: Case-insensitive matching for size/resolution values
+        # User may pass "1k" but rules define "1K", or "480p" vs "480P"
+        return str(v).strip().upper()  # "1k" → "1K", "480p" → "480P"
     
     normalized_user = {
         k.lower().strip(): normalize_value(v)
@@ -449,27 +594,6 @@ def select_credit_rule_by_params(credit_rules: list, user_params: dict) -> dict 
     return credit_rules[0]
 
 
-def get_valid_attribute_keys(credit_rules: list) -> set:
-    """
-    Extract all valid attribute keys from credit_rules dynamically.
-    
-    This avoids hardcoding parameter lists that may become outdated.
-    Scans all credit_rules[].attributes and collects keys (excluding special markers).
-    
-    Returns: set of attribute keys that can be used for credit_rule matching
-    """
-    valid_keys = set()
-    
-    for rule in credit_rules:
-        attrs = rule.get("attributes", {})
-        for key, value in attrs.items():
-            # Skip special markers like {"default": "enabled"}
-            if not (key == "default" and value == "enabled"):
-                valid_keys.add(key)
-    
-    return valid_keys
-
-
 # ─── Step 3: Create Task ──────────────────────────────────────────────────────
 
 def create_task(base_url: str, api_key: str,
@@ -492,24 +616,22 @@ def create_task(base_url: str, api_key: str,
     if input_images is None:
         input_images = []
 
-    # Smart credit_rule selection based on user params
+    # Smart credit_rule selection based on merged params (form defaults + user overrides)
+    # 🔧 FIX: Always try to match credit_rule based on actual parameters (not just user params)
+    # This fixes Nano Banana 2 defaulting to 512px rule when form_config defaults to 1K
     all_rules = model_params.get("all_credit_rules", [])
     normalized_rule_params = {}  # 🆕 Store normalized params from matched rule
     
-    if extra_params and all_rules:
-        # ✅ DYNAMIC: Extract valid attribute keys from credit_rules
-        # This replaces the hardcoded list and stays in sync with backend
-        valid_keys = get_valid_attribute_keys(all_rules)
+    if all_rules:
+        # Merge form_config defaults + user overrides (user params take priority)
+        merged_params = {**model_params["form_params"], **(extra_params or {})}
         
-        # Filter user params to only include keys that appear in credit_rules.attributes
-        candidate_params = {k: v for k, v in extra_params.items() if k in valid_keys}
-        
-        # Common attribute keys (for reference, but not used for filtering):
-        # Image: size, quality, n
-        # Video: duration, resolution, generate_audio, sound, mode,
-        #        fast_pretreatment, prompt_optimizer
-        # Music: (typically no attributes in credit_rules)
-        
+        # Extract params that might be in attributes
+        # CRITICAL: ONLY include keys that actually appear in credit_rules.attributes
+        # Image credit_rules.attributes: size, quality, n
+        candidate_params = {k: v for k, v in merged_params.items() 
+                          if k in ["size", "quality", "n"]}
+        # ⚠️ REMOVED: resolution, sample_image_size (form_config defaults, not in attributes)
         if candidate_params:
             selected_rule = select_credit_rule_by_params(all_rules, candidate_params)
             if selected_rule:
@@ -519,7 +641,7 @@ def create_task(base_url: str, api_key: str,
                 # 🆕 CRITICAL FIX: Use normalized values from the matched rule's attributes
                 # This ensures API gets "1K" (from rule) instead of "1k" (from user)
                 rule_attrs = selected_rule.get("attributes", {})
-                for key in valid_keys:
+                for key in ["size", "quality", "n"]:
                     if key in rule_attrs:
                         normalized_rule_params[key] = rule_attrs[key]
                 
@@ -536,19 +658,18 @@ def create_task(base_url: str, api_key: str,
         attribute_id = model_params["attribute_id"]
         credit = model_params["credit"]
 
-    # ✅ FIX for error 6010: Merge parameters in correct priority order
-    # Priority (low → high): form_params < rule_attributes < normalized_rule_params < extra_params
-    # CRITICAL: rule_attributes MUST override form_params to match attribute_id
+    # ✅ FIX for error 6009: Merge parameters in correct priority order
+    # Priority (low → high): rule_attributes < form_params < normalized_rule_params < extra_params (non-rule keys)
+    # This ensures backend validation always gets required fields from attributes
     inner: dict = {}
     
-    # 1. First merge form_config defaults (UI defaults, lowest priority)
-    inner.update(model_params["form_params"])
-    
-    # 2. Then merge rule_attributes (required fields from credit_rules, MUST override form_params)
-    # ⚠️ This fixes error 6010: rule_attributes define the params required by attribute_id
+    # 1. First merge rule_attributes (required fields from credit_rules, lowest priority)
     rule_attrs = model_params.get("rule_attributes", {})
     if rule_attrs:
         inner.update(rule_attrs)
+    
+    # 2. Then merge form_config defaults (optional fields, medium priority)
+    inner.update(model_params["form_params"])
     
     # 3. Merge normalized params from matched rule (higher priority - these are canonical values)
     # 🆕 CRITICAL: This overwrites user's "1k" with rule's "1K" to match attribute_id
@@ -567,30 +688,6 @@ def create_task(base_url: str, api_key: str,
     inner["n"]            = int(inner.get("n", 1))
     inner["input_images"] = input_images
     inner["cast"]         = {"points": credit, "attribute_id": attribute_id}
-    
-    # 🆕 CRITICAL: Preserve model parameter from form_config if present
-    # Some models (e.g. Pixverse) use the same model_id but distinguish versions via this parameter
-    # Example: model_id="pixverse" with model="v5.5" | "v5" | "v4.5" | "v4" | "v3.5"
-    # Priority: form_config default < user override (if provided)
-    if "model" in model_params.get("form_params", {}):
-        # Use default from form_config (e.g. "v5.5")
-        inner["model"] = model_params["form_params"]["model"]
-    if extra_params and "model" in extra_params:
-        # Allow user to explicitly override the version
-        inner["model"] = extra_params["model"]
-    
-    # 🆕 CRITICAL: Auto-infer model parameter for Pixverse if missing
-    # Pixverse V5.5/V5/V4 don't have model in form_config, but backend requires it
-    # Error: "Invalid value for model" or "The Fusion feature is supported in model v4.5, v5, v5.5 and v5.6 only"
-    if model_params.get("model_id") == "pixverse" and "model" not in inner:
-        # Extract version from model_name: "Pixverse V5.5" → "v5.5"
-        model_name = model_params.get("model_name", "")
-        import re
-        version_match = re.search(r'V(\d+(?:\.\d+)?)', model_name, re.IGNORECASE)
-        if version_match:
-            version = version_match.group(1)  # "5.5", "5", "4.5", "4", "3.5"
-            inner["model"] = f"v{version}"
-            print(f"🔧 Auto-inferred Pixverse model parameter: model=\"v{version}\" (from model_name=\"{model_name}\")", flush=True)
 
     payload = {
         "task_type":          task_type,
@@ -738,7 +835,7 @@ def poll_task(base_url: str, api_key: str, task_id: str,
         time.sleep(poll_interval)
 
 
-# ─── Reflection Mechanism (v1.0.5) ────────────────────────────────────────────
+# ─── Reflection Mechanism (v1.0.4) ────────────────────────────────────────────
 
 def extract_error_info(exception: Exception) -> dict:
     """
@@ -774,7 +871,6 @@ def extract_error_info(exception: Exception) -> dict:
             }
     
     # Check for API error codes in RuntimeError message (6009, 6010, etc.)
-    import re
     code_match = re.search(r'code[=:]?\s*(\d+)', error_str, re.IGNORECASE)
     if code_match:
         code = int(code_match.group(1))
@@ -800,6 +896,223 @@ def extract_error_info(exception: Exception) -> dict:
     }
 
 
+def _normalize_compare_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value).strip().upper()
+
+
+def _parse_min_pixels(text: str) -> int | None:
+    match = re.search(
+        r"(?:at\s+least\s+(\d+)\s+pixels|pixels?\s+should\s+be\s+at\s+least\s+(\d+))",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def _parse_size_dims(value) -> tuple[int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d{2,5})\s*[xX×]\s*(\d{2,5})", value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _format_rule_attributes(rule: dict, max_items: int = 4) -> str:
+    attrs = rule.get("attributes") or {}
+    parts = [f"{k}={v}" for k, v in attrs.items() if not (k == "default" and v == "enabled")]
+    if not parts:
+        return "<default rule>"
+    return ", ".join(parts[:max_items])
+
+
+def _best_rule_mismatch(credit_rules: list, merged_params: dict) -> dict | None:
+    if not credit_rules:
+        return None
+    best = None
+    normalized_params = {
+        str(k).strip().lower(): _normalize_compare_value(v)
+        for k, v in merged_params.items()
+    }
+    for rule in credit_rules:
+        attrs = rule.get("attributes") or {}
+        if not attrs:
+            continue
+        missing: list[str] = []
+        conflicts: list[tuple[str, str, str]] = []
+        matched = 0
+        for key, expected in attrs.items():
+            if key == "default" and expected == "enabled":
+                continue
+            k = str(key).strip().lower()
+            expected_norm = _normalize_compare_value(expected)
+            actual_norm = normalized_params.get(k)
+            if actual_norm is None:
+                missing.append(str(key))
+            elif actual_norm == expected_norm:
+                matched += 1
+            else:
+                actual_raw = merged_params.get(key, merged_params.get(k, ""))
+                conflicts.append((str(key), str(actual_raw), str(expected)))
+        score = matched * 3 - len(missing) * 2 - len(conflicts) * 3
+        candidate = {
+            "rule": rule,
+            "missing": missing,
+            "conflicts": conflicts,
+            "score": score,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def build_contextual_diagnosis(error_info: dict,
+                               task_type: str,
+                               model_params: dict,
+                               current_params: dict | None,
+                               input_images: list[str] | None,
+                               credit_rules: list | None) -> dict:
+    code = error_info.get("code")
+    raw_message = str(error_info.get("message") or "")
+    msg_lower = raw_message.lower()
+    merged_params = dict(model_params.get("form_params") or {})
+    merged_params.update(current_params or {})
+    media_inputs = input_images or []
+    model_name = model_params.get("model_name") or "unknown_model"
+    model_id = model_params.get("model_id") or "unknown_model_id"
+
+    diagnosis = {
+        "code": code,
+        "confidence": "medium",
+        "headline": "Model task failed with current configuration",
+        "reasoning": [],
+        "actions": [],
+        "model_name": model_name,
+        "model_id": model_id,
+        "task_type": task_type,
+    }
+
+    if task_type == "image_to_image" and not media_inputs:
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "Missing required reference image for image_to_image"
+        diagnosis["reasoning"].append("image_to_image requires at least one input image URL/path.")
+        diagnosis["actions"].append("Provide --input-images with at least one image URL/path.")
+        return diagnosis
+
+    if code == 401 or "unauthorized" in msg_lower:
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "API key is invalid or unauthorized"
+        diagnosis["actions"].append("Regenerate API key: https://www.imaclaw.ai/imaclaw/apikey")
+        diagnosis["actions"].append("Retry with the new key in --api-key.")
+        return diagnosis
+
+    if code == 4008 or "insufficient points" in msg_lower:
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "Account points are not enough for this image request"
+        diagnosis["actions"].append("Top up credits: https://www.imaclaw.ai/imaclaw/subscription")
+        diagnosis["actions"].append("Or switch to a lower-cost model/size.")
+        return diagnosis
+
+    min_pixels = _parse_min_pixels(raw_message)
+    dims = _parse_size_dims(str(merged_params.get("size") or "")) or _parse_size_dims(raw_message)
+    if min_pixels is not None and dims is not None:
+        requested_pixels = dims[0] * dims[1]
+        if requested_pixels < min_pixels:
+            diagnosis["confidence"] = "high"
+            diagnosis["headline"] = "Output size is below this model's minimum pixel requirement"
+            diagnosis["reasoning"].append(
+                f"Requested size {dims[0]}x{dims[1]} ({requested_pixels} px) is below required {min_pixels} px."
+            )
+            target = int(math.ceil(math.sqrt(min_pixels)))
+            diagnosis["actions"].append(f"Increase --size to at least around {target}x{target}.")
+            diagnosis["actions"].append("Retry with the same model.")
+            return diagnosis
+
+    credit_rules = credit_rules or []
+    rule_mismatch = _best_rule_mismatch(credit_rules, merged_params)
+    if (
+        code in (6009, 6010)
+        or "invalid product attribute" in msg_lower
+        or "no matching" in msg_lower
+        or "attribute" in msg_lower
+    ):
+        diagnosis["confidence"] = "high" if code in (6009, 6010) else "medium"
+        diagnosis["headline"] = "Current parameter combination does not fit this model rule set"
+        if rule_mismatch:
+            if rule_mismatch["missing"]:
+                diagnosis["reasoning"].append(
+                    "Missing parameters for best-matching rule: "
+                    + ", ".join(rule_mismatch["missing"][:4])
+                )
+            if rule_mismatch["conflicts"]:
+                compact = ", ".join(
+                    f"{k}={got} (expected {expected})"
+                    for k, got, expected in rule_mismatch["conflicts"][:3]
+                )
+                diagnosis["reasoning"].append(f"Conflicting values: {compact}")
+            diagnosis["actions"].append(
+                "Use a rule-compatible profile: " + _format_rule_attributes(rule_mismatch["rule"])
+            )
+        diagnosis["actions"].append("Remove custom --extra-params and retry with defaults.")
+        return diagnosis
+
+    if code == "timeout" or "timed out" in msg_lower:
+        diagnosis["headline"] = "Task exceeded polling timeout for current image settings"
+        diagnosis["actions"].append("Retry with lower size/quality.")
+        diagnosis["actions"].append("Check task status in dashboard: https://imagent.bot")
+        return diagnosis
+
+    if code == 500 or "internal server error" in msg_lower:
+        diagnosis["headline"] = "Backend rejected current parameter complexity"
+        for key in ("size", "quality"):
+            if key in merged_params:
+                fallback = get_param_degradation_strategy(key, str(merged_params[key]))
+                if fallback:
+                    diagnosis["actions"].append(f"Try {key}={fallback[0]} (current {merged_params[key]}).")
+                    break
+        diagnosis["actions"].append("Retry after simplifying parameters.")
+        return diagnosis
+
+    diagnosis["reasoning"].append(
+        f"Model context: {model_name} ({model_id}), task={task_type}, media_count={len(media_inputs)}."
+    )
+    diagnosis["actions"].append("Retry with defaults (remove --extra-params).")
+    diagnosis["actions"].append("Use --list-models to verify supported settings.")
+    return diagnosis
+
+
+def format_user_failure_message(diagnosis: dict,
+                                attempts_used: int,
+                                max_attempts: int) -> str:
+    lines = [
+        f"Task failed after {attempts_used}/{max_attempts} attempt(s).",
+        (
+            f"Model: {diagnosis.get('model_name')} ({diagnosis.get('model_id')}) | "
+            f"Task: {diagnosis.get('task_type')}"
+        ),
+        f"Likely cause ({diagnosis.get('confidence', 'medium')} confidence): {diagnosis.get('headline')}",
+    ]
+    reasoning = diagnosis.get("reasoning") or []
+    if reasoning:
+        lines.append("Why this diagnosis:")
+        for item in reasoning[:3]:
+            lines.append(f"- {item}")
+    actions = diagnosis.get("actions") or []
+    if actions:
+        lines.append("What to do next:")
+        for i, action in enumerate(actions[:4], 1):
+            lines.append(f"{i}. {action}")
+    code = diagnosis.get("code")
+    if code not in (None, "", "unknown"):
+        lines.append(f"Reference code: {code}")
+    lines.append("Technical details were recorded in local logs.")
+    return "\n".join(lines)
+
+
 def get_param_degradation_strategy(param_key: str, current_value: str) -> list:
     """
     Get degradation sequence for a parameter when error occurs.
@@ -807,34 +1120,17 @@ def get_param_degradation_strategy(param_key: str, current_value: str) -> list:
     Returns list of fallback values to try, from high-quality to low-quality.
     Empty list means no degradation available.
     """
-    # Size degradation (4K → 2K → 1K → 512px) for image
+    # Size degradation (4K → 2K → 1K → 512px)
     if param_key.lower() == "size":
         size_map = {
             "4k": ["2k", "1k", "512px"],
             "2k": ["1k", "512px"],
             "1k": ["512px"],
-            "512px": []
+            "512px": []  # Already lowest
         }
         return size_map.get(current_value.lower(), [])
     
-    # Resolution degradation (1080p → 720p → 480p) for video
-    if param_key.lower() == "resolution":
-        res_map = {
-            "1080p": ["720p", "480p"],
-            "720p": ["480p"],
-            "480p": []
-        }
-        return res_map.get(current_value.lower(), [])
-    
-    # Duration degradation (10s → 5s) for video
-    if param_key.lower() == "duration":
-        dur_map = {
-            "10s": ["5s"],
-            "5s": []
-        }
-        return dur_map.get(current_value.lower(), [])
-    
-    # Quality degradation
+    # Quality degradation (high → standard → low)
     if param_key.lower() == "quality":
         quality_map = {
             "高清": ["标清"],
@@ -879,14 +1175,14 @@ def reflect_on_failure(error_info: dict,
     if code == 500 or "http_500" in error_type:
         logger.info("Strategy: Degrade parameters due to 500 error")
         
-        # Try to degrade a parameter (prioritize based on task type)
-        for key in ["size", "resolution", "duration", "quality"]:
+        # Try to degrade a parameter (prioritize 'size')
+        for key in ["size", "quality"]:
             if key in current_params:
                 current_val = current_params[key]
                 fallbacks = get_param_degradation_strategy(key, current_val)
                 
                 if fallbacks:
-                    new_val = fallbacks[0]
+                    new_val = fallbacks[0]  # Take first fallback
                     new_params = current_params.copy()
                     new_params[key] = new_val
                     
@@ -898,6 +1194,7 @@ def reflect_on_failure(error_info: dict,
                         "reason": f"500 error with {key}='{current_val}', degrading to '{new_val}'"
                     }
         
+        # No degradation available
         return {
             "action": "give_up",
             "suggestion": f"Model '{model_params['model_name']}' returned 500 Internal Server Error. "
@@ -910,10 +1207,12 @@ def reflect_on_failure(error_info: dict,
         logger.info("Strategy: Add missing parameters from credit_rules (6009)")
         
         if credit_rules and len(credit_rules) > 0:
+            # Use the lowest-cost rule's attributes as reference
             min_rule = min(credit_rules, key=lambda r: r.get("points", 9999))
             rule_attrs = min_rule.get("attributes", {})
             
             if rule_attrs:
+                # Merge: keep current params, add missing ones from rule
                 new_params = current_params.copy()
                 added = []
                 
@@ -942,6 +1241,7 @@ def reflect_on_failure(error_info: dict,
         logger.info("Strategy: Reselect credit_rule based on current params (6010)")
         
         if credit_rules:
+            # Try to find better matching rule
             selected = select_credit_rule_by_params(credit_rules, current_params)
             
             if selected:
@@ -949,6 +1249,7 @@ def reflect_on_failure(error_info: dict,
                 new_points = selected.get("points")
                 rule_attrs = selected.get("attributes", {})
                 
+                # Merge rule attributes into params (rule takes priority for 6010)
                 new_params = current_params.copy()
                 new_params.update(rule_attrs)
                 
@@ -1055,6 +1356,7 @@ def create_task_with_reflection(base_url: str, api_key: str,
             logger.error(f"❌ Attempt {attempt} failed: {error_info['type']} - {error_info['message']}")
             
             if attempt < max_attempts:
+                # Reflect and try again
                 reflection = reflect_on_failure(
                     error_info=error_info,
                     attempt=attempt,
@@ -1063,7 +1365,7 @@ def create_task_with_reflection(base_url: str, api_key: str,
                     model_params=model_params
                 )
                 
-                last_reflection = reflection
+                last_reflection = reflection  # Save for next iteration
                 
                 if reflection["action"] == "retry":
                     current_params = reflection["new_params"]
@@ -1071,40 +1373,53 @@ def create_task_with_reflection(base_url: str, api_key: str,
                     logger.info(f"   Retrying with new params: {current_params}")
                     continue
                 else:
+                    # Reflection says give up early
                     logger.error(f"💡 Reflection suggests giving up: {reflection.get('suggestion')}")
+                    diagnosis = build_contextual_diagnosis(
+                        error_info=error_info,
+                        task_type=task_type,
+                        model_params=model_params,
+                        current_params=current_params,
+                        input_images=input_images,
+                        credit_rules=credit_rules,
+                    )
+                    logger.error(
+                        "Contextual diagnosis (early give-up): %s",
+                        json.dumps(diagnosis, ensure_ascii=False),
+                    )
                     raise RuntimeError(
-                        f"Task creation failed after {attempt} attempt(s).\n\n"
-                        f"💡 Suggestion: {reflection.get('suggestion')}\n\n"
-                        f"Attempt log:\n" + json.dumps(attempt_log, indent=2, ensure_ascii=False)
+                        format_user_failure_message(
+                            diagnosis=diagnosis,
+                            attempts_used=attempt,
+                            max_attempts=max_attempts,
+                        )
                     ) from e
             else:
+                # Max attempts reached
                 logger.error(f"❌ All {max_attempts} attempts failed")
-                
                 last_error = attempt_log[-1]["error"]
-                suggestion = f"All {max_attempts} attempts failed. Last error: {last_error['message']}"
-                
-                if last_error['code'] in [401, 500, 4008, 6009, 6010]:
-                    suggestion += f"\n\n💡 This may indicate:\n"
-                    if last_error['code'] == 401:
-                        suggestion += "  - API key is invalid or unauthorized\n"
-                        suggestion += "  - 🔗 Generate API Key: https://www.imaclaw.ai/imaclaw/apikey\n"
-                    elif last_error['code'] == 4008:
-                        suggestion += "  - Insufficient points to create this task\n"
-                        suggestion += "  - 🔗 Buy Credits: https://www.imaclaw.ai/imaclaw/subscription\n"
-                    elif last_error['code'] == 500:
-                        suggestion += "  - Backend server issue or unsupported parameter\n"
-                        suggestion += "  - Try a different model or simpler parameters\n"
-                    elif last_error['code'] == 6009:
-                        suggestion += "  - No matching pricing rule for your parameters\n"
-                        suggestion += "  - Try using default parameters or check available options\n"
-                    elif last_error['code'] == 6010:
-                        suggestion += "  - Parameter/pricing rule mismatch\n"
-                        suggestion += "  - Refresh the model list or use recommended parameters\n"
-                
+                diagnosis = build_contextual_diagnosis(
+                    error_info=last_error,
+                    task_type=task_type,
+                    model_params=model_params,
+                    current_params=current_params,
+                    input_images=input_images,
+                    credit_rules=credit_rules,
+                )
+                logger.error(
+                    "Contextual diagnosis (max attempts): %s",
+                    json.dumps(diagnosis, ensure_ascii=False),
+                )
+                logger.error(
+                    "Attempt log (debug only): %s",
+                    json.dumps(attempt_log, ensure_ascii=False),
+                )
                 raise RuntimeError(
-                    f"Task creation failed after {max_attempts} attempts.\n\n"
-                    f"{suggestion}\n\n"
-                    f"Full attempt log:\n" + json.dumps(attempt_log, indent=2, ensure_ascii=False)
+                    format_user_failure_message(
+                        diagnosis=diagnosis,
+                        attempts_used=max_attempts,
+                        max_attempts=max_attempts,
+                    )
                 ) from e
 
 
@@ -1142,62 +1457,49 @@ def get_preferred_model_id(user_id: str, task_type: str) -> str | None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="IMA AI Creation Script — reliable task creation via Open API",
+        description="IMA Image Creation Script — specialized for image generation via Open API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Text to image (SeeDream 4.5 — newest default)
-  python3 ima_create.py \\
+  python3 ima_image_create.py \\
     --api-key ima_xxx --task-type text_to_image \\
     --model-id doubao-seedream-4.5 --prompt "a cute puppy"
 
   # Text to image with size override
-  python3 ima_create.py \\
+  python3 ima_image_create.py \\
     --api-key ima_xxx --task-type text_to_image \\
     --model-id doubao-seedream-4.5 --prompt "city skyline" --size 2k
 
-  # Text to video (Wan 2.6 — most popular default)
-  python3 ima_create.py \\
-    --api-key ima_xxx --task-type text_to_video \\
-    --model-id wan2.6-t2v --prompt "a puppy running on grass, cinematic"
-
-  # Image to video (Wan 2.6)
-  python3 ima_create.py \\
-    --api-key ima_xxx --task-type image_to_video \\
-    --model-id wan2.6-i2v --prompt "camera slowly zooms in" \\
+  # Image to image (style transfer)
+  python3 ima_image_create.py \\
+    --api-key ima_xxx --task-type image_to_image \\
+    --model-id doubao-seedream-4.5 --prompt "turn into oil painting style" \\
     --input-images https://example.com/photo.jpg
 
-  # Text to music (Suno sonic-v5)
-  python3 ima_create.py \\
-    --api-key ima_xxx --task-type text_to_music \\
-    --model-id sonic --prompt "upbeat lo-fi hip hop, 90 BPM"
-
-  # Text to speech (TTS) — use model_id from --list-models for category text_to_speech
-  python3 ima_create.py \\
-    --api-key ima_xxx --task-type text_to_speech \\
-    --model-id <from list-models> --prompt "Text to be spoken"
-
   # List all models for a category
-  python3 ima_create.py \\
-    --api-key ima_xxx --task-type text_to_video --list-models
+  python3 ima_image_create.py \\
+    --api-key ima_xxx --task-type text_to_image --list-models
 """,
     )
 
-    p.add_argument("--api-key",  required=True,
-                   help="IMA Open API key (starts with ima_)")
+    p.add_argument("--api-key",  required=False,
+                   help="IMA Open API key (starts with ima_). Can also use IMA_API_KEY env var")
     p.add_argument("--task-type", required=True,
                    choices=list(POLL_CONFIG.keys()),
-                   help="Task type to create")
+                   help="Task type: text_to_image or image_to_image")
     p.add_argument("--model-id",
                    help="Model ID from product list (e.g. doubao-seedream-4.5)")
     p.add_argument("--version-id",
                    help="Specific version ID — overrides auto-select of latest")
     p.add_argument("--prompt",
                    help="Generation prompt (required unless --list-models)")
-    p.add_argument("--input-images", nargs="*", default=[],
-                   help="Input image URLs (for image_to_image, image_to_video, etc.)")
+    p.add_argument("--input-images", nargs="*", action="append", default=[],
+                   help="Input image URLs or local file paths (required for image_to_image). "
+                        "Can be repeated multiple times; values are merged. "
+                        "Local files will be automatically uploaded using the API key.")
     p.add_argument("--size",
-                   help="Override size parameter (e.g. 4k, 2k, 1024x1024)")
+                   help="Override size parameter (e.g. 4k, 2k, 2048x2048)")
     p.add_argument("--extra-params",
                    help='JSON string of extra inner parameters, e.g. \'{"n":2}\'')
     p.add_argument("--language", default="en",
@@ -1214,10 +1516,26 @@ Examples:
     return p
 
 
+def flatten_input_images_args(raw_groups) -> list[str]:
+    """Merge repeated --input-images groups into one flat list."""
+    flattened: list[str] = []
+    for group in raw_groups or []:
+        if isinstance(group, list):
+            flattened.extend([str(v) for v in group if str(v).strip()])
+        elif group is not None and str(group).strip():
+            flattened.append(str(group))
+    return flattened
+
+
 def main():
     args   = build_parser().parse_args()
     base   = args.base_url
-    apikey = args.api_key
+    
+    # Get API key from args or environment variable
+    apikey = args.api_key or os.getenv("IMA_API_KEY")
+    if not apikey:
+        logger.error("API key is required. Use --api-key or set IMA_API_KEY environment variable")
+        sys.exit(1)
 
     start_time = time.time()
     masked_key = f"{apikey[:10]}..." if len(apikey) > 10 else "***"
@@ -1298,7 +1616,32 @@ def main():
             print(f"❌ Invalid --extra-params JSON: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # ── 4. Create task (with Reflection) ──────────────────────────────────────
+    # ── 4. Process input images (upload if needed) ────────────────────────────
+    input_images_args = flatten_input_images_args(args.input_images)
+    processed_images: list[str] = []
+    if input_images_args:
+        im_base = os.getenv("IMA_IM_BASE_URL", DEFAULT_IM_BASE_URL)
+        
+        print(f"\n📤 Processing {len(input_images_args)} input image(s)…", flush=True)
+        for i, img_source in enumerate(input_images_args, 1):
+            try:
+                # Use API key directly for upload authentication
+                img_url = prepare_image_url(img_source, apikey, im_base)
+                processed_images.append(img_url)
+                
+                if img_source.startswith("https://"):
+                    print(f"   [{i}] Using URL directly: {img_url[:60]}...")
+                else:
+                    print(f"   [{i}] Uploaded: {os.path.basename(img_source) if isinstance(img_source, str) else 'bytes'} → {img_url[:60]}...")
+            
+            except RuntimeError as e:
+                logger.error(f"Failed to process image {i}: {e}")
+                print(f"❌ Failed to process image [{i}]: {e}", file=sys.stderr)
+                sys.exit(1)
+        
+        print(f"✅ All {len(processed_images)} image(s) ready")
+
+    # ── 5. Create task (with Reflection) ──────────────────────────────────────
     print(f"\n🚀 Creating task…", flush=True)
     try:
         task_id = create_task_with_reflection(
@@ -1307,18 +1650,35 @@ def main():
             task_type=args.task_type,
             model_params=mp,
             prompt=args.prompt,
-            input_images=args.input_images or [],
+            input_images=processed_images,
             extra_params=extra if extra else None,
             max_attempts=3  # Up to 3 automatic retries with reflection
         )
     except RuntimeError as e:
         logger.error(f"Task creation failed after reflection: {str(e)}")
-        print(f"❌ Create task failed:\n{e}", file=sys.stderr)
+        create_error = extract_error_info(e)
+        diagnosis = build_contextual_diagnosis(
+            error_info=create_error,
+            task_type=args.task_type,
+            model_params=mp,
+            current_params=extra if extra else {},
+            input_images=processed_images,
+            credit_rules=mp.get("all_credit_rules", []),
+        )
+        print(
+            "❌ "
+            + format_user_failure_message(
+                diagnosis=diagnosis,
+                attempts_used=1,
+                max_attempts=1,
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print(f"✅ Task created: {task_id}", flush=True)
 
-    # ── 5. Poll for result ─────────────────────────────────────────────────────
+    # ── 6. Poll for result ─────────────────────────────────────────────────────
     cfg        = POLL_CONFIG.get(args.task_type, {"interval": 5, "max_wait": 300})
     est_max    = cfg["max_wait"] // 2   # optimistic estimate = half of max_wait
     print(f"\n⏳ Polling… (interval={cfg['interval']}s, max={cfg['max_wait']}s)",
@@ -1331,7 +1691,28 @@ def main():
                           max_wait=cfg["max_wait"])
     except (TimeoutError, RuntimeError) as e:
         logger.error(f"Task polling failed: {str(e)}")
-        print(f"\n❌ {e}", file=sys.stderr)
+        poll_error = extract_error_info(e)
+        diagnosis = build_contextual_diagnosis(
+            error_info=poll_error,
+            task_type=args.task_type,
+            model_params=mp,
+            current_params=extra if extra else {},
+            input_images=processed_images,
+            credit_rules=mp.get("all_credit_rules", []),
+        )
+        logger.error(
+            "Polling contextual diagnosis: %s",
+            json.dumps(diagnosis, ensure_ascii=False),
+        )
+        print(
+            "\n❌ "
+            + format_user_failure_message(
+                diagnosis=diagnosis,
+                attempts_used=1,
+                max_attempts=1,
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── 6. Save preference ────────────────────────────────────────────────────
